@@ -69,7 +69,7 @@ static void truncate_utf8_string(char *dest, const char *src, size_t dest_size,
 			chars++;
 			last_valid_len = i + 1;
 			if (chars == max_chars && src[i + 1] != '\0') {
-				strcpy(dest + last_valid_len, "...");
+				snprintf(dest + last_valid_len, 4, "...");
 				return;
 			}
 		}
@@ -564,7 +564,7 @@ static void update_bar_json(Bar *bar, cJSON *json) {
 	if ((item = cJSON_GetObjectItem(json, "active")))
 		bar->sel = cJSON_IsTrue(item);
 	if ((item = cJSON_GetObjectItem(json, "layout_symbol")))
-		strncpy(bar->layout, item->valuestring, sizeof(bar->layout) - 1);
+		snprintf(bar->layout, sizeof(bar->layout), "%s", item->valuestring);
 
 	cJSON *client = cJSON_GetObjectItem(json, "active_client");
 	if (client && !cJSON_IsNull(client)) {
@@ -651,11 +651,9 @@ static void process_ipc_msg(const char *msg) {
 			Bar *b;
 			wl_list_for_each(b, &bar_list, link) {
 				if (km)
-					strncpy(b->keymode, km->valuestring,
-							sizeof(b->keymode) - 1);
+					snprintf(b->keymode, sizeof(b->keymode), "%s", km->valuestring);
 				if (kl)
-					strncpy(b->kb_layout, kl->valuestring,
-							sizeof(b->kb_layout) - 1);
+					snprintf(b->kb_layout, sizeof(b->kb_layout), "%s", kl->valuestring);
 				b->redraw = true;
 			}
 		}
@@ -672,11 +670,9 @@ static void process_ipc_msg(const char *msg) {
 			Bar *b;
 			wl_list_for_each(b, &bar_list, link) {
 				if (km)
-					strncpy(b->keymode, km->valuestring,
-							sizeof(b->keymode) - 1);
+					snprintf(b->keymode, sizeof(b->keymode), "%s", km->valuestring);
 				if (kl)
-					strncpy(b->kb_layout, kl->valuestring,
-							sizeof(b->kb_layout) - 1);
+					snprintf(b->kb_layout, sizeof(b->kb_layout), "%s", kl->valuestring);
 				b->redraw = true;
 			}
 		}
@@ -704,7 +700,7 @@ static void ipc_connect() {
 	if (ipc_fd < 0)
 		return;
 	struct sockaddr_un addr = {.sun_family = AF_UNIX};
-	strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
 	if (connect(ipc_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		close(ipc_fd);
 		ipc_fd = -1;
@@ -756,7 +752,7 @@ static void update_system_info() {
 	char ts[16];
 	strftime(ts, sizeof(ts), "%H:%M", tm);
 	Bar *b;
-	wl_list_for_each(b, &bar_list, link) strcpy(b->time_str, ts);
+	wl_list_for_each(b, &bar_list, link) snprintf(b->time_str, sizeof(b->time_str), "%s", ts);
 }
 
 static void event_loop() {
