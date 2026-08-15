@@ -10,6 +10,10 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      homeManagerModule = args@{ pkgs, ... }:
+        (import ./nix/home-manager.nix {
+          package = self.packages.${pkgs.stdenv.hostPlatform.system}.mangobar;
+        }) args;
     in
     {
       packages = forAllSystems (system:
@@ -67,14 +71,8 @@
         });
 
       homeManagerModules = {
-        default = { pkgs, ... }:
-          import ./nix/home-manager.nix {
-            package = self.packages.${pkgs.stdenv.hostPlatform.system}.mangobar;
-          };
-        mangobar = { pkgs, ... }:
-          import ./nix/home-manager.nix {
-            package = self.packages.${pkgs.stdenv.hostPlatform.system}.mangobar;
-          };
+        default = homeManagerModule;
+        mangobar = homeManagerModule;
       };
     };
 }
