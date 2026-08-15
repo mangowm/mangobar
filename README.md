@@ -61,6 +61,26 @@ automatically; install any newly added dependencies first.
 Runtime note: `pamixer` / `brightnessctl` are only needed if your
 config's click/scroll actions call them.
 
+### Home Manager
+
+The flake exports a Home Manager module. Add it to your flake inputs and
+enable the user service:
+
+```nix
+{
+  imports = [ inputs.mangobar.homeManagerModules.default ];
+
+  services.mangobar = {
+    enable = true;
+    systemdTarget = "mango.target";
+  };
+}
+```
+
+The service starts with `graphical-session.target` by default. Set
+`systemdTarget` to your compositor's user target, such as `mango.target`.
+Override `services.mangobar.package` to use a different mangobar derivation.
+
 ## Usage
 
 Run `mangobar` inside a mangowm session. It reads configuration from:

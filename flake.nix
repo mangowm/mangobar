@@ -65,5 +65,16 @@
             inputsFrom = [ self.packages.${system}.mangobar ];
           };
         });
+
+      homeManagerModules = {
+        default = { pkgs, ... }:
+          import ./nix/home-manager.nix {
+            package = self.packages.${pkgs.stdenv.hostPlatform.system}.mangobar;
+          };
+        mangobar = { pkgs, ... }:
+          import ./nix/home-manager.nix {
+            package = self.packages.${pkgs.stdenv.hostPlatform.system}.mangobar;
+          };
+      };
     };
 }
