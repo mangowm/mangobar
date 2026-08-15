@@ -85,7 +85,7 @@ Set `services.mangobar.settings` to generate
 `~/.config/mangobar/config.jsonc` from a Nix attribute set, or use
 `services.mangobar.configFile` for an existing JSONC file. These options are
 mutually exclusive. Changing either configuration restarts the service during
-Home Manager activation; rebuilding only the package does not.
+Home Manager activation; rebuilding the mangobar package does as well.
 
 ```nix
 services.mangobar.settings = {

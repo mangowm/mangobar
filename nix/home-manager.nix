@@ -61,9 +61,10 @@ in
         After = [ cfg.systemdTarget ];
         PartOf = [ cfg.systemdTarget ];
         X-Restart-Triggers =
-          lib.optional (cfg.settings != null)
+          [ cfg.package ]
+          ++ lib.optional (cfg.settings != null)
             config.xdg.configFile."mangobar/config.jsonc".source
-          ++ lib.optional (cfg.configFile != null) cfg.configFile;
+          ++ lib.optional (cfg.configFile != null) (toString cfg.configFile);
       };
 
       Service = {
