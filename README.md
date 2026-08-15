@@ -127,6 +127,18 @@ continuous scroll only triggers once. It can be set at the top level or in a
 module block (`"workspaces": { ..., "scroll-interval": 100 }`), where the
 module value wins.
 
+`smooth-scrolling-threshold` controls how much continuous pointer-axis motion
+(such as a touchpad two-finger gesture) produces one scroll action. It defaults
+to `5.0`. Mangobar accumulates motion independently for horizontal and vertical
+axes, preserving any amount below the threshold for the next frame. Discrete
+mouse-wheel steps continue to use their protocol-provided step count. Set it
+at the top level for all modules, or in a module block (as in Waybar) to
+override that module:
+
+```jsonc
+"backlight": { "smooth-scrolling-threshold": 5.0 }
+```
+
 Every module accepts `"max-length"` (in characters, `0` = unlimited, the
 default for all modules). The `window` module is squeezed by the other
 modules when no limit is set: it shows fully up to the remaining bar width,

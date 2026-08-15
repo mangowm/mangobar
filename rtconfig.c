@@ -207,6 +207,7 @@ static void add_action(const char *module, const char *left,
   cfg_set(a->scroll_up, sizeof(a->scroll_up), scroll_up);
   cfg_set(a->scroll_down, sizeof(a->scroll_down), scroll_down);
   a->scroll_interval = -1;
+  a->smooth_scroll_threshold = -1.0;
   g_cfg.action_count++;
 }
 
@@ -257,6 +258,19 @@ static void set_action_interval(const char *module, cJSON *m) {
   }
 }
 
+static void set_action_smooth_threshold(const char *module, cJSON *m) {
+  cJSON *threshold =
+      cJSON_GetObjectItemCaseSensitive(m, "smooth-scrolling-threshold");
+  if (!cJSON_IsNumber(threshold) || threshold->valuedouble <= 0.0)
+    return;
+  for (int i = 0; i < g_cfg.action_count; i++) {
+    if (strcmp(g_cfg.actions[i].module, module) == 0) {
+      g_cfg.actions[i].smooth_scroll_threshold = threshold->valuedouble;
+      break;
+    }
+  }
+}
+
 // Register all click/scroll actions of a module block at once.
 static void set_module_actions(cJSON *m, const char *module) {
   set_action(module,
@@ -266,6 +280,7 @@ static void set_module_actions(cJSON *m, const char *module) {
              cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-up")),
              cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-down")));
   set_action_interval(module, m);
+  set_action_smooth_threshold(module, m);
 }
 
 static void cfg_alt(cJSON *m, const char *module) {
@@ -314,6 +329,7 @@ static void parse_custom_module(cJSON *obj, const char *name) {
              cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj, "on-click-right")),
              cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj, "on-scroll-up")),
              cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj, "on-scroll-down")));
+  set_action_smooth_threshold(css_name, obj);
 }
 
 // Map "activate"/"toggle" actions to mango IPC commands
@@ -438,6 +454,7 @@ static void parse_module_configs(cJSON *root) {
                cJSON_GetStringValue(
                    cJSON_GetObjectItemCaseSensitive(m, "on-scroll-down")));
     set_action_interval("tags", m);
+    set_action_smooth_threshold("tags", m);
   }
 
   m = cJSON_GetObjectItemCaseSensitive(root, "layout");
@@ -494,6 +511,7 @@ static void parse_module_configs(cJSON *root) {
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-click-right")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-up")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-down")));
+    set_action_smooth_threshold("cpu", m);
   }
 
   m = cJSON_GetObjectItemCaseSensitive(root, "memory");
@@ -505,6 +523,7 @@ static void parse_module_configs(cJSON *root) {
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-click-right")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-up")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-down")));
+    set_action_smooth_threshold("mem", m);
   }
 
   m = cJSON_GetObjectItemCaseSensitive(root, "backlight");
@@ -522,6 +541,7 @@ static void parse_module_configs(cJSON *root) {
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-click-right")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-up")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-down")));
+    set_action_smooth_threshold("brightness", m);
   }
 
   m = cJSON_GetObjectItemCaseSensitive(root, "pulseaudio");
@@ -542,6 +562,7 @@ static void parse_module_configs(cJSON *root) {
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-click-right")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-up")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-down")));
+    set_action_smooth_threshold("volume", m);
   }
 
   m = cJSON_GetObjectItemCaseSensitive(root, "clock#time");
@@ -615,6 +636,7 @@ static void parse_module_configs(cJSON *root) {
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-click-right")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-up")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-down")));
+    set_action_smooth_threshold("hideclients", m);
   }
 
   m = cJSON_GetObjectItemCaseSensitive(root, "battery");
@@ -639,6 +661,7 @@ static void parse_module_configs(cJSON *root) {
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-click-right")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-up")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-down")));
+    set_action_smooth_threshold("battery", m);
   }
 }
 
@@ -652,6 +675,7 @@ void mango_config_defaults(void) {
   g_cfg.layer = 2; // TOP
   g_cfg.max_title_len = 50;
   g_cfg.sys_interval = 2;
+  g_cfg.smooth_scroll_threshold = 5.0;
   g_cfg.tag_count = MANGOBAR_MAX_TAGS;
   for (int i = 0; i < g_cfg.tag_count && i < MANGOBAR_MAX_TAGS; i++)
     snprintf(g_cfg.tag_names[i], sizeof(g_cfg.tag_names[i]), "%d", i + 1);
@@ -788,6 +812,10 @@ int mango_config_parse(const char *jsonc) {
   if ((v = cJSON_GetObjectItemCaseSensitive(root, "scroll-interval")) &&
       cJSON_IsNumber(v) && v->valueint >= 0)
     g_cfg.scroll_interval = v->valueint;
+  if ((v = cJSON_GetObjectItemCaseSensitive(root,
+                                             "smooth-scrolling-threshold")) &&
+      cJSON_IsNumber(v) && v->valuedouble > 0.0)
+    g_cfg.smooth_scroll_threshold = v->valuedouble;
   if ((v = cJSON_GetObjectItemCaseSensitive(root, "layer")) &&
       cJSON_IsString(v)) {
     if (strcmp(v->valuestring, "overlay") == 0)

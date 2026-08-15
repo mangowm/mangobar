@@ -457,6 +457,11 @@ static Bar *pointer_bar;
 static double pointer_x, pointer_y;
 static int axis_steps[2];
 static wl_fixed_t axis_value[2];
+// Smooth pointer-axis motion is reported in small fractional values. Keep the
+// unconsumed distance per axis so it can cross the threshold in a later frame.
+static double axis_smooth_remainder[2];
+static bool frame_has_axis;            // axis events arrived since last frame
+static uint8_t axis_stop_mask;         // axes that reported gesture end
 static bool sys_refresh; // force immediate system info refresh
 
 // Persistent PulseAudio context: volume changes arrive via subscription
@@ -2006,6 +2011,19 @@ static void handle_module_action(Bar *bar, const char *module, int tag,
 static void menu_open(Bar *bar, MangobarTrayItem *item, double lx, double ly);
 static void tray_right_click(Bar *bar, double x, double y);
 
+static double smooth_scroll_threshold_at(const Bar *bar, double x) {
+  for (int i = 0; i < bar->hotspot_count; i++) {
+    const Hotspot *h = &bar->hotspots[i];
+    if (x >= h->x1 && x < h->x2) {
+      const MangoAction *ma = find_action(h->module);
+      if (ma && ma->smooth_scroll_threshold > 0.0)
+        return ma->smooth_scroll_threshold;
+      break;
+    }
+  }
+  return g_cfg.smooth_scroll_threshold;
+}
+
 static void dispatch_pointer_event(Bar *bar, double x, double y,
                                    uint32_t button) {
   if (!bar)
@@ -2904,6 +2922,11 @@ static void wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
     popup_pointer = false;
     pointer_on_sub = false;
   }
+  // Scrolling state only makes sense while the pointer is on the bar. Drop
+  // any unconsumed distance so re-entering cannot fire stale scroll actions.
+  memset(axis_smooth_remainder, 0, sizeof(axis_smooth_remainder));
+  frame_has_axis = false;
+  axis_stop_mask = 0;
   pointer_bar = NULL;
 }
 
@@ -2958,8 +2981,10 @@ static void wl_pointer_button(void *data, struct wl_pointer *wl_pointer,
 
 static void wl_pointer_axis(void *data, struct wl_pointer *wl_pointer,
                             uint32_t time, uint32_t axis, wl_fixed_t value) {
-  if (axis < 2)
+  if (axis < 2) {
     axis_value[axis] += value;
+    frame_has_axis = true;
+  }
 }
 
 static void wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
@@ -2970,37 +2995,73 @@ static void wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
 }
 
 static void wl_pointer_frame(void *data, struct wl_pointer *wl_pointer) {
-  if (!pointer_bar)
+  // Axis events can arrive after the pointer left the bar. They do not belong
+  // to a hotspot, so discard this frame without contaminating a later one.
+  if (!pointer_bar) {
+    memset(axis_steps, 0, sizeof(axis_steps));
+    memset(axis_value, 0, sizeof(axis_value));
+    frame_has_axis = false;
+    axis_stop_mask = 0;
     return;
+  }
+
+  // Only frames that actually carried axis events may touch the smooth
+  // remainder; motion, button and enter frames must not drain it.
+  bool has_axis = frame_has_axis;
+  frame_has_axis = false;
+
+  double threshold = smooth_scroll_threshold_at(pointer_bar, pointer_x);
+
   for (int a = 0; a < 2; a++) {
     int steps = axis_steps[a];
-    double v = wl_fixed_to_double(axis_value[a]);
+    int n = 0;
     int dir = 0; // -1=up/left, 1=down/right
-    if (steps > 0)
-      dir = 1;
-    else if (steps < 0)
-      dir = -1;
-    else if (v > 0)
-      dir = 1;
-    else if (v < 0)
-      dir = -1;
-    int n = steps != 0 ? abs(steps) : (int)(v / 15.0);
-    if (n < 0)
-      n = -n;
+
+    // Mouse wheels supply a discrete count alongside their continuous value.
+    // Prefer that exact count and do not fold its companion value into the
+    // smooth-scroll remainder.
+    if (steps != 0) {
+      dir = steps < 0 ? -1 : 1;
+      n = abs(steps);
+    } else if (has_axis) {
+      axis_smooth_remainder[a] += wl_fixed_to_double(axis_value[a]);
+      double remainder = axis_smooth_remainder[a];
+      if (remainder != 0.0) {
+        dir = remainder < 0.0 ? -1 : 1;
+        n = (int)(fabs(remainder) / threshold);
+      }
+    }
+
+    // Limit a single Wayland frame, but retain any additional distance for
+    // subsequent frames instead of dropping it.
     if (n > 4)
       n = 4;
-    if (n <= 0 || dir == 0) {
-      axis_steps[a] = 0;
-      axis_value[a] = 0;
-      continue;
+    if (has_axis && steps == 0 && n > 0)
+      axis_smooth_remainder[a] -=
+          dir * n * threshold;
+
+    if (pointer_bar && n > 0 && dir != 0) {
+      for (int i = 0; i < n; i++) {
+        uint32_t btn = (a == 0) ? (dir < 0 ? 4 : 5) : (dir < 0 ? 6 : 7);
+        dispatch_pointer_event(pointer_bar, pointer_x, pointer_y, btn);
+      }
     }
-    for (int i = 0; i < n; i++) {
-      uint32_t btn = (a == 0) ? (dir < 0 ? 4 : 5) : (dir < 0 ? 6 : 7);
-      dispatch_pointer_event(pointer_bar, pointer_x, pointer_y, btn);
-    }
+
+    // axis_* values describe only this wl_pointer.frame. The smooth remainder
+    // above is intentionally persistent and is consumed one threshold at a
+    // time.
     axis_steps[a] = 0;
     axis_value[a] = 0;
   }
+
+  // The compositor reports the end of a continuous gesture (e.g. fingers
+  // lifted) with axis_stop, which arrives before this frame. Drop whatever
+  // distance the last frame could not consume; it must not fire stale scrolls
+  // after the gesture is over.
+  for (int a = 0; a < 2; a++)
+    if (axis_stop_mask & (1u << a))
+      axis_smooth_remainder[a] = 0.0;
+  axis_stop_mask = 0;
 }
 
 static void wl_pointer_axis_source(void *data, struct wl_pointer *wl_pointer,
@@ -3009,6 +3070,8 @@ static void wl_pointer_axis_source(void *data, struct wl_pointer *wl_pointer,
 
 static void wl_pointer_axis_stop(void *data, struct wl_pointer *wl_pointer,
                                  uint32_t time, uint32_t axis) {
+  if (axis < 2)
+    axis_stop_mask |= 1u << axis;
 }
 
 static const struct wl_pointer_listener pointer_listener = {

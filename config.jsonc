@@ -4,6 +4,7 @@
     "height": 30,
     "buffer-scale": 1,
     // "scroll-interval": 100,
+    // "smooth-scrolling-threshold": 5.0,
 
     "modules-left": [
         "workspaces",
