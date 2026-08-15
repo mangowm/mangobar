@@ -61,6 +61,17 @@ automatically; install any newly added dependencies first.
 Runtime note: `pamixer` / `brightnessctl` are only needed if your
 config's click/scroll actions call them.
 
+### Nix
+
+Build the package locally with:
+
+```sh
+nix build .#mangobar
+./result/bin/mangobar
+```
+
+
+
 ### Home Manager
 
 The flake exports a Home Manager module. Add it to your flake inputs and
