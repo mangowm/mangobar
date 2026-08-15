@@ -81,6 +81,19 @@ The service starts with `graphical-session.target` by default. Set
 `systemdTarget` to your compositor's user target, such as `mango.target`.
 Override `services.mangobar.package` to use a different mangobar derivation.
 
+Set `services.mangobar.settings` to generate
+`~/.config/mangobar/config.jsonc` from a Nix attribute set, or use
+`services.mangobar.configFile` for an existing JSONC file. These options are
+mutually exclusive. Changing either configuration restarts the service during
+Home Manager activation; rebuilding only the package does not.
+
+```nix
+services.mangobar.settings = {
+  modules-left = [ "workspaces" "layout" "window" ];
+  modules-right = [ "cpu" "memory" "clock#time" ];
+};
+```
+
 ## Usage
 
 Run `mangobar` inside a mangowm session. It reads configuration from:
