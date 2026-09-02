@@ -432,6 +432,57 @@ static void parse_modules(cJSON *root) {
                     &g_cfg.right_count);
 }
 
+// Parse one monitor override object: { "modules-left": [...], ... }. Keys that
+// are absent inherit the global lists; a present (possibly empty) list wins.
+static void parse_monitor_override(cJSON *obj, MangoMonitorCfg *mc) {
+  mc->left_count = mc->center_count = mc->right_count = 0;
+  mc->left_set = mc->center_set = mc->right_set = false;
+  if (cJSON_GetObjectItemCaseSensitive(obj, "modules-left")) {
+    parse_module_list(obj, "modules-left", mc->left_order, &mc->left_count);
+    mc->left_set = true;
+  }
+  if (cJSON_GetObjectItemCaseSensitive(obj, "modules-center")) {
+    parse_module_list(obj, "modules-center", mc->center_order,
+                      &mc->center_count);
+    mc->center_set = true;
+  }
+  if (cJSON_GetObjectItemCaseSensitive(obj, "modules-right")) {
+    parse_module_list(obj, "modules-right", mc->right_order, &mc->right_count);
+    mc->right_set = true;
+  }
+}
+
+// Parse the top-level "monitors" block. Accepts either an object keyed by
+// output name ("eDP-1": {...}) or an array of { "output": ..., ... } items.
+static void parse_monitors(cJSON *root) {
+  g_cfg.monitor_count = 0;
+  cJSON *mon = cJSON_GetObjectItemCaseSensitive(root, "monitors");
+  if (cJSON_IsArray(mon)) {
+    cJSON *item;
+    cJSON_ArrayForEach(item, mon) {
+      if (!cJSON_IsObject(item) || g_cfg.monitor_count >= MANGOBAR_MAX_MONITORS)
+        continue;
+      MangoMonitorCfg *mc = &g_cfg.monitors[g_cfg.monitor_count++];
+      memset(mc, 0, sizeof(*mc));
+      cJSON *out = cJSON_GetObjectItemCaseSensitive(item, "output");
+      if (cJSON_IsString(out))
+        snprintf(mc->output, sizeof(mc->output), "%s", out->valuestring);
+      parse_monitor_override(item, mc);
+    }
+  } else if (cJSON_IsObject(mon)) {
+    cJSON *item;
+    cJSON_ArrayForEach(item, mon) {
+      if (!cJSON_IsObject(item) || !item->string ||
+          g_cfg.monitor_count >= MANGOBAR_MAX_MONITORS)
+        continue;
+      MangoMonitorCfg *mc = &g_cfg.monitors[g_cfg.monitor_count++];
+      memset(mc, 0, sizeof(*mc));
+      snprintf(mc->output, sizeof(mc->output), "%s", item->string);
+      parse_monitor_override(item, mc);
+    }
+  }
+}
+
 static void parse_module_configs(cJSON *root) {
   cJSON *m;
 
@@ -869,6 +920,7 @@ int mango_config_parse(const char *jsonc) {
     cfg_set(g_cfg.css_path, sizeof(g_cfg.css_path), v->valuestring);
 
   parse_modules(root);
+  parse_monitors(root);
   parse_module_configs(root);
   cJSON_Delete(root);
   return 0;

@@ -28,6 +28,21 @@
         "custom/power"
     ],
 
+    // Per-output module layout override (key = output name, e.g. eDP-1 / DP-2 / HDMI-A-1).
+    // Omitted modules-* keys inherit the global defaults; an explicit [] empties that side.
+    // "*" matches every output not listed by name.
+    // "monitors": {
+    //     "eDP-1": {
+    //         "modules-left": ["workspaces", "layout", "window"],
+    //         "modules-right": ["tray", "clock#time", "custom/power"]
+    //     },
+    //     "DP-2": {
+    //         "modules-left": ["workspaces", "window"],
+    //         "modules-right": ["clock#time"]
+    //     },
+    //     "*": { "modules-left": ["workspaces"] }
+    // },
+
     "workspaces": {
         "hide-empty": true,
         // "pinned": [1, 2],

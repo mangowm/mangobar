@@ -437,6 +437,7 @@ typedef struct {
   char net_ifname[64];
   double net_rx_kbps, net_tx_kbps;
   bool redraw;
+  MangoMonitorCfg *mcfg; // per-output module layout override (NULL = global)
   bool overview_mode; // true when active_tags == [0]
   Hotspot hotspots[MAX_HOTSPOTS];
   int hotspot_count;
@@ -1389,6 +1390,25 @@ static void draw_bar(Bar *bar) {
   IPC_LOG("[draw] %s enter\n", bar->name);
   g_draw_scale = bar->scale > 0 ? (uint32_t)bar->scale : 1;
   g_draw_font = font_for_scale(bar->scale);
+  // Per-output module layout override, falling back to the global order.
+  const int *right_order = bar->mcfg && bar->mcfg->right_set
+                               ? bar->mcfg->right_order
+                               : g_cfg.right_order;
+  int right_count = bar->mcfg && bar->mcfg->right_set
+                        ? bar->mcfg->right_count
+                        : g_cfg.right_count;
+  const int *center_order = bar->mcfg && bar->mcfg->center_set
+                                ? bar->mcfg->center_order
+                                : g_cfg.center_order;
+  int center_count = bar->mcfg && bar->mcfg->center_set
+                         ? bar->mcfg->center_count
+                         : g_cfg.center_count;
+  const int *left_order = bar->mcfg && bar->mcfg->left_set
+                              ? bar->mcfg->left_order
+                              : g_cfg.left_order;
+  int left_count = bar->mcfg && bar->mcfg->left_set
+                       ? bar->mcfg->left_count
+                       : g_cfg.left_count;
   int fd = allocate_shm_file(bar->bufsize);
   if (fd < 0) {
     IPC_LOG("[draw] %s shm alloc FAILED\n", bar->name);
@@ -1452,7 +1472,7 @@ static void draw_bar(Bar *bar) {
   char right_texts[MAX_MODULE_ENTRIES][256];
   char right_names[MAX_MODULE_ENTRIES][96];
   int rtext_n = 0, rname_n = 0;
-  int right_n = build_module_entries(bar, g_cfg.right_order, g_cfg.right_count,
+  int right_n = build_module_entries(bar, right_order, right_count,
                                      right_ents, MAX_MODULE_ENTRIES,
                                      right_texts, right_names, &rtext_n,
                                      &rname_n);
@@ -1476,7 +1496,7 @@ static void draw_bar(Bar *bar) {
   char center_names[MAX_MODULE_ENTRIES][96];
   int ctext_n = 0, cname_n = 0;
   int center_n =
-      build_module_entries(bar, g_cfg.center_order, g_cfg.center_count,
+      build_module_entries(bar, center_order, center_count,
                            center_ents, MAX_MODULE_ENTRIES, center_texts,
                            center_names, &ctext_n, &cname_n);
   uint32_t center_cw = 0;
@@ -1517,7 +1537,7 @@ static void draw_bar(Bar *bar) {
   char scratch_texts[MAX_MODULE_ENTRIES][256];
   char scratch_names[MAX_MODULE_ENTRIES][96];
   int stext_n = 0, sname_n = 0;
-  int left_n = build_module_entries(bar, g_cfg.left_order, g_cfg.left_count,
+  int left_n = build_module_entries(bar, left_order, left_count,
                                     scratch, MAX_MODULE_ENTRIES,
                                     scratch_texts, scratch_names, &stext_n,
                                     &sname_n);
@@ -1737,11 +1757,32 @@ static const struct wl_output_listener wl_output_listener = {
     .scale = wl_output_scale,
 };
 
+// Resolve the per-output module layout for an output name. Exact name match
+// wins; otherwise a "*" (or empty-name) entry acts as the fallback; otherwise
+// NULL means "use the global modules-left/center/right defaults".
+static MangoMonitorCfg *monitor_cfg_for_name(const char *name) {
+  if (!name)
+    name = "";
+  for (int i = 0; i < g_cfg.monitor_count; i++) {
+    if (g_cfg.monitors[i].output[0] &&
+        strcmp(g_cfg.monitors[i].output, name) == 0)
+      return &g_cfg.monitors[i];
+  }
+  for (int i = 0; i < g_cfg.monitor_count; i++) {
+    if (g_cfg.monitors[i].output[0] == '\0' ||
+        strcmp(g_cfg.monitors[i].output, "*") == 0)
+      return &g_cfg.monitors[i];
+  }
+  return NULL;
+}
+
 static void output_name_handler(void *data, struct zxdg_output_v1 *xdg_output,
                                 const char *name) {
   Bar *bar = data;
   free(bar->name);
   bar->name = strdup(name);
+  bar->mcfg = monitor_cfg_for_name(name);
+  bar->redraw = true; // layout may change once the output name is known
 }
 
 static void output_logical_position(void *data,
