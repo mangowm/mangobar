@@ -13,6 +13,7 @@
 #define MANGOBAR_MAX_ALTS 128
 #define MANGOBAR_MAX_ICONS 64
 #define MANGOBAR_MAX_LENS 128
+#define MANGOBAR_MAX_MONITORS 16
 
 enum MangoModule {
   M_NONE = 0,
@@ -81,6 +82,22 @@ typedef struct {
   int max_length;  /* 0 = unlimited */
 } MangoMaxLen;
 
+// One entry of the top-level config array besides the default entry: a
+// per-output module layout override. The *_set flags distinguish "not
+// configured" (inherit global) from an explicit empty list "[]" (empty).
+typedef struct {
+  char output[64]; // output name to match
+  int left_order[MANGOBAR_MAX_MODULES];
+  int center_order[MANGOBAR_MAX_MODULES];
+  int right_order[MANGOBAR_MAX_MODULES];
+  int left_count;
+  int center_count;
+  int right_count;
+  bool left_set;
+  bool center_set;
+  bool right_set;
+} MangoMonitorCfg;
+
 typedef struct {
   int bar_height;
   int buffer_scale;
@@ -138,6 +155,8 @@ typedef struct {
   int alt_count;
   MangoMaxLen max_lens[MANGOBAR_MAX_LENS];
   int max_len_count;
+  MangoMonitorCfg monitors[MANGOBAR_MAX_MONITORS];
+  int monitor_count;
   char css_path[512];
 } MangoConfig;
 

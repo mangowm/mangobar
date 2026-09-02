@@ -432,6 +432,48 @@ static void parse_modules(cJSON *root) {
                     &g_cfg.right_count);
 }
 
+// Parse one monitor override object: { "modules-left": [...], ... }. Keys that
+// are absent inherit the global lists; a present (possibly empty) list wins.
+static void parse_monitor_override(cJSON *obj, MangoMonitorCfg *mc) {
+  mc->left_count = mc->center_count = mc->right_count = 0;
+  mc->left_set = mc->center_set = mc->right_set = false;
+  if (cJSON_GetObjectItemCaseSensitive(obj, "modules-left")) {
+    parse_module_list(obj, "modules-left", mc->left_order, &mc->left_count);
+    mc->left_set = true;
+  }
+  if (cJSON_GetObjectItemCaseSensitive(obj, "modules-center")) {
+    parse_module_list(obj, "modules-center", mc->center_order,
+                      &mc->center_count);
+    mc->center_set = true;
+  }
+  if (cJSON_GetObjectItemCaseSensitive(obj, "modules-right")) {
+    parse_module_list(obj, "modules-right", mc->right_order, &mc->right_count);
+    mc->right_set = true;
+  }
+}
+
+// Parse the non-default entries of the top-level config array as per-output
+// module layout overrides. The default entry (already parsed into the global
+// config) is skipped.
+static void parse_monitors(cJSON *root, cJSON *default_obj) {
+  g_cfg.monitor_count = 0;
+  if (!cJSON_IsArray(root))
+    return;
+  cJSON *item;
+  cJSON_ArrayForEach(item, root) {
+    if (!cJSON_IsObject(item) || item == default_obj ||
+        g_cfg.monitor_count >= MANGOBAR_MAX_MONITORS)
+      continue;
+    cJSON *out = cJSON_GetObjectItemCaseSensitive(item, "output");
+    if (!cJSON_IsString(out))
+      continue;
+    MangoMonitorCfg *mc = &g_cfg.monitors[g_cfg.monitor_count++];
+    memset(mc, 0, sizeof(*mc));
+    snprintf(mc->output, sizeof(mc->output), "%s", out->valuestring);
+    parse_monitor_override(item, mc);
+  }
+}
+
 static void parse_module_configs(cJSON *root) {
   cJSON *m;
 
@@ -829,30 +871,23 @@ const char *mango_config_find_default(char *buf, size_t sz) {
   return NULL;
 }
 
-int mango_config_parse(const char *jsonc) {
-  char *stripped = jsonc_strip(jsonc);
-  if (!stripped)
-    return -1;
-  cJSON *root = cJSON_Parse(stripped);
-  free(stripped);
-  if (!root)
-    return -1;
-
+// Parse bar-level options (height, layer, ...) from an entry object.
+static void parse_bar_options(cJSON *obj) {
   cJSON *v;
-  if ((v = cJSON_GetObjectItemCaseSensitive(root, "height")) &&
+  if ((v = cJSON_GetObjectItemCaseSensitive(obj, "height")) &&
       cJSON_IsNumber(v))
     g_cfg.bar_height = v->valueint;
-  if ((v = cJSON_GetObjectItemCaseSensitive(root, "buffer-scale")) &&
+  if ((v = cJSON_GetObjectItemCaseSensitive(obj, "buffer-scale")) &&
       cJSON_IsNumber(v) && v->valueint > 0)
     g_cfg.buffer_scale = v->valueint;
-  if ((v = cJSON_GetObjectItemCaseSensitive(root, "scroll-interval")) &&
+  if ((v = cJSON_GetObjectItemCaseSensitive(obj, "scroll-interval")) &&
       cJSON_IsNumber(v) && v->valueint >= 0)
     g_cfg.scroll_interval = v->valueint;
-  if ((v = cJSON_GetObjectItemCaseSensitive(root,
+  if ((v = cJSON_GetObjectItemCaseSensitive(obj,
                                              "smooth-scrolling-threshold")) &&
       cJSON_IsNumber(v) && v->valuedouble > 0.0)
     g_cfg.smooth_scroll_threshold = v->valuedouble;
-  if ((v = cJSON_GetObjectItemCaseSensitive(root, "layer")) &&
+  if ((v = cJSON_GetObjectItemCaseSensitive(obj, "layer")) &&
       cJSON_IsString(v)) {
     if (strcmp(v->valuestring, "overlay") == 0)
       g_cfg.layer = 3;
@@ -862,14 +897,59 @@ int mango_config_parse(const char *jsonc) {
       g_cfg.layer = 2;
   }
   // CSS style file (accepts "css" or "style")
-  v = cJSON_GetObjectItemCaseSensitive(root, "css");
+  v = cJSON_GetObjectItemCaseSensitive(obj, "css");
   if (!cJSON_IsString(v))
-    v = cJSON_GetObjectItemCaseSensitive(root, "style");
+    v = cJSON_GetObjectItemCaseSensitive(obj, "style");
   if (cJSON_IsString(v))
     cfg_set(g_cfg.css_path, sizeof(g_cfg.css_path), v->valuestring);
+}
 
-  parse_modules(root);
-  parse_module_configs(root);
+// Find the default entry of the top-level config array: the entry whose
+// "output" is "*" or empty, otherwise the first object. A bare object (old
+// format) is returned as-is for backward compatibility.
+static cJSON *find_default_entry(cJSON *root) {
+  if (cJSON_IsObject(root))
+    return root;
+  if (!cJSON_IsArray(root))
+    return NULL;
+  cJSON *item;
+  cJSON_ArrayForEach(item, root) {
+    if (!cJSON_IsObject(item))
+      continue;
+    cJSON *out = cJSON_GetObjectItemCaseSensitive(item, "output");
+    if (cJSON_IsString(out) &&
+        (strcmp(out->valuestring, "*") == 0 || out->valuestring[0] == '\0'))
+      return item;
+  }
+  cJSON_ArrayForEach(item, root) {
+    if (cJSON_IsObject(item))
+      return item;
+  }
+  return NULL;
+}
+
+int mango_config_parse(const char *jsonc) {
+  char *stripped = jsonc_strip(jsonc);
+  if (!stripped)
+    return -1;
+  cJSON *root = cJSON_Parse(stripped);
+  free(stripped);
+  if (!root)
+    return -1;
+
+  // The top-level value is an array of per-output bar configs. One entry
+  // (the "*" fallback, or the first) carries the global options, module
+  // lists and module configs; the rest override modules-left/center/right.
+  cJSON *default_obj = find_default_entry(root);
+  if (!default_obj) {
+    cJSON_Delete(root);
+    return -1;
+  }
+
+  parse_bar_options(default_obj);
+  parse_modules(default_obj);
+  parse_module_configs(default_obj);
+  parse_monitors(root, default_obj);
   cJSON_Delete(root);
   return 0;
 }
