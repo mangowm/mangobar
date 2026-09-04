@@ -13,6 +13,8 @@
 #define MANGOBAR_MAX_ALTS 128
 #define MANGOBAR_MAX_ICONS 64
 #define MANGOBAR_MAX_LENS 128
+#define MANGOBAR_MAX_CONFIGS 64
+#define MANGOBAR_MAX_OUTPUT_NAMES 64
 
 enum MangoModule {
   M_NONE = 0,
@@ -141,13 +143,48 @@ typedef struct {
   char css_path[512];
 } MangoConfig;
 
-extern MangoConfig g_cfg;
+typedef struct {
+  MangoConfig config;
+  char *output_names[MANGOBAR_MAX_OUTPUT_NAMES];
+  size_t output_count;
+} MangoConfigProfile;
+
+typedef struct {
+  MangoConfigProfile *profiles;
+  size_t count;
+  int default_index; /* -1 when no output-less fallback exists */
+} MangoConfigSet;
+
+typedef enum {
+  MANGO_CONFIG_NO_MATCH = 0,
+  MANGO_CONFIG_MATCH_ENABLED,
+} MangoConfigMatch;
+
+/* Legacy single-config runtime view; `g_cfg` expands to the pointed config. */
+extern MangoConfig *g_cfg_ptr;
+#define g_cfg (*g_cfg_ptr)
 
 void mango_config_defaults(void);
-// Load config from JSONC; returns 0 on success
+// Load one legacy root-object config; returns 0 on success.
 int mango_config_load(const char *path);
-// Parse JSONC config from a string; returns 0 on success
+// Parse one legacy root-object config from a string; returns 0 on success.
 int mango_config_parse(const char *jsonc);
+
+// Parse/load a configuration set. Accepts a single object, a root array of
+// profile objects, or a comma-separated root object sequence. On failure err
+// receives a user-facing reason (profile index included for per-profile
+// errors).
+int mango_config_set_parse(MangoConfigSet *set, const char *jsonc, char *err,
+                           size_t errsz);
+int mango_config_set_load(MangoConfigSet *set, const char *path, char *err,
+                          size_t errsz);
+void mango_config_set_destroy(MangoConfigSet *set);
+// Match an xdg-output name. Returns MATCH_ENABLED and fills *profile when a
+// profile or the default fallback applies, otherwise NO_MATCH.
+MangoConfigMatch mango_config_set_match(const MangoConfigSet *set,
+                                        const char *output_name,
+                                        MangoConfigProfile **profile);
+
 // Search order: $MANGOBAR_CONFIG, ~/.config/mangobar/config.jsonc
 const char *mango_config_find_default(char *buf, size_t sz);
 

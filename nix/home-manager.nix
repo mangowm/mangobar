@@ -22,7 +22,10 @@ in
     };
 
     settings = lib.mkOption {
-      type = lib.types.nullOr lib.types.attrs;
+      type = lib.types.nullOr (lib.types.oneOf [
+        lib.types.attrs
+        (lib.types.listOf lib.types.attrs)
+      ]);
       default = null;
       example = lib.literalExpression ''
         {
@@ -30,7 +33,7 @@ in
           modules-right = [ "cpu" "memory" "clock#time" ];
         }
       '';
-      description = "JSON-serializable mangobar settings written to config.jsonc.";
+      description = "JSON-serializable mangobar settings written to config.jsonc. A single attribute set writes one config object; a non-empty list writes a JSON root array with one entry per monitor output profile. Empty lists are not valid.";
     };
 
     configFile = lib.mkOption {
@@ -52,7 +55,14 @@ in
     home.packages = [ cfg.package ];
 
     xdg.configFile = lib.mkIf (cfg.settings != null) {
-      "mangobar/config.jsonc".text = builtins.toJSON cfg.settings;
+      "mangobar/config.jsonc".text =
+        if builtins.isList cfg.settings then
+          if cfg.settings == [ ] then
+            throw "services.mangobar.settings must not be an empty list"
+          else
+            builtins.toJSON cfg.settings
+        else
+          builtins.toJSON cfg.settings;
     };
 
     systemd.user.services.mangobar = {

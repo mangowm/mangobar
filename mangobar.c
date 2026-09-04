@@ -189,22 +189,32 @@ typedef struct {
 static void apply_css_resolved(ModuleStyle *ms, Style s);
 
 // Tag states: 0=active 1=occupied 2=urgent 3=empty 4=inactive
-static ModuleStyle st_tags[5];
-static ModuleStyle st_tags_hover_scratch;
-static Style st_tag_hover_css;
-static ModuleStyle st_layout, st_title, st_clock, st_clock_date, st_cpu, st_mem;
-static ModuleStyle st_network, st_hide_clients, st_battery;
-static ModuleStyle st_brightness, st_volume;
-static ModuleStyle st_keymode, st_keyboardlayout;
-static ModuleStyle st_custom[MANGOBAR_MAX_CUSTOM];
-static ModuleStyle st_overview, st_separator, st_tray, st_bar, st_bar_sel;
+// Per-profile module styles and bar geometry. The StyleSheet itself is shared
+// across all outputs, but the resolved ModuleStyle values depend on each
+// profile's bar_height and custom module set.
+typedef struct {
+  ModuleStyle st_tags[5];
+  ModuleStyle st_tags_hover_scratch;
+  Style st_tag_hover_css;
+  ModuleStyle st_layout, st_title, st_clock, st_clock_date, st_cpu, st_mem;
+  ModuleStyle st_network, st_hide_clients, st_battery;
+  ModuleStyle st_brightness, st_volume;
+  ModuleStyle st_keymode, st_keyboardlayout;
+  ModuleStyle st_custom[MANGOBAR_MAX_CUSTOM];
+  ModuleStyle st_overview, st_separator, st_tray, st_bar, st_bar_sel;
+  int bar_top;
+  uint32_t bar_h;
+  uint32_t bar_left, bar_right;
+  char brightness_dev[64];
+  bool brightness_dev_init;
+  MangoConfigProfile *profile;
+} ProfileRuntime;
 
 static StyleSheet g_style_sheet;
 static cairo_t *bar_bg_cr; // cairo context for module backgrounds
-static int bar_top; // content offset from surface top (CSS margin-top)
-static uint32_t bar_h; // content height (logical px)
-static uint32_t bar_left; // content offset from left (CSS margin-left)
-static uint32_t bar_right; // content offset from right (CSS margin-right)
+static ProfileRuntime *g_rt; // profile runtime for the bar being drawn
+static MangoConfigSet g_config_set;
+static ProfileRuntime *g_runtimes; // one per profile, indexed by pointer diff
 
 // ---------- Format helpers ----------
 static uint32_t text_metrics(const char *text, int32_t *min_x, int32_t *max_x);
@@ -410,6 +420,7 @@ typedef struct {
   int out_w, out_h; // output logical size
   bool configured;
   int scale;          // effective buffer scale for this output
+  int wl_scale;       // physical scale factor reported by wl_output.scale
   uint32_t logical_w, logical_h; // logical surface size
   int tag_count;      // max tag number reported by the WM for this output
   uint32_t width, height;
@@ -438,6 +449,9 @@ typedef struct {
   double net_rx_kbps, net_tx_kbps;
   bool redraw;
   bool overview_mode; // true when active_tags == [0]
+  MangoConfigProfile *profile; // matched profile (NULL when disabled/unmatched)
+  ProfileRuntime *rt;          // profile runtime (NULL before surface creation)
+  bool active;                 // layer surface created for this output
   Hotspot hotspots[MAX_HOTSPOTS];
   int hotspot_count;
   TrayHotspot tray_hotspots[MAX_TRAY_HOTSPOTS];
@@ -493,11 +507,13 @@ static bool brightness_dirty;
 // Custom module realtime-signal triggers (SIGRTMIN+N, like Waybar's custom
 // module "signal" option). The handler only sets flags and pokes an eventfd;
 // the event loop wakes up and re-runs the affected modules.
-static volatile sig_atomic_t custom_signal_dirty[MANGOBAR_MAX_CUSTOM];
+static volatile sig_atomic_t
+    custom_signal_dirty[MANGOBAR_MAX_CONFIGS][MANGOBAR_MAX_CUSTOM];
 static struct {
   int signo;
-  int ci;
-} custom_signal_map[MANGOBAR_MAX_CUSTOM];
+  int pi; // profile index
+  int ci; // custom index within the profile
+} custom_signal_map[MANGOBAR_MAX_CONFIGS * MANGOBAR_MAX_CUSTOM];
 static int custom_signal_count;
 static int signal_fd = -1;
 
@@ -774,12 +790,12 @@ static uint32_t draw_module(Bar *bar, const char *module, int tag,
     if (bar_bg_cr) {
       cairo_pattern_t *pat = NULL;
       if (st->bg_gradient) {
-        double x1d = (double)x1, y1d = (double)bar_top;
-        double x2d = (double)x2, y2d = (double)(bar_top + buf_h);
+        double x1d = (double)x1, y1d = (double)g_rt->bar_top;
+        double x2d = (double)x2, y2d = (double)(g_rt->bar_top + buf_h);
         if (st->gradient_dir == 1) { // to top: vertical, bottom -> top
           x2d = x1d;
-          y1d = (double)(bar_top + buf_h);
-          y2d = (double)bar_top;
+          y1d = (double)(g_rt->bar_top + buf_h);
+          y2d = (double)g_rt->bar_top;
         } else if (st->gradient_dir == 2) { // to left: horizontal, right -> left
           y2d = y1d;
           x1d = (double)x2;
@@ -801,7 +817,7 @@ static uint32_t draw_module(Bar *bar, const char *module, int tag,
         pixman_color_to_doubles(&st->bg, &r, &g, &b, &a);
         cairo_set_source_rgba(bar_bg_cr, r, g, b, a);
       }
-      cairo_rounded_rect(bar_bg_cr, x1, bar_top, (double)(x2 - x1),
+      cairo_rounded_rect(bar_bg_cr, x1, g_rt->bar_top, (double)(x2 - x1),
                                 (double)buf_h, rad);
       cairo_fill(bar_bg_cr);
       if (pat)
@@ -810,8 +826,8 @@ static uint32_t draw_module(Bar *bar, const char *module, int tag,
       uint32_t s = g_draw_scale > 0 ? g_draw_scale : 1;
       pixman_image_fill_boxes(
           PIXMAN_OP_OVER, bg, &st->bg, 1,
-          &(pixman_box32_t){.x1 = x1 * s, .x2 = x2 * s, .y1 = bar_top * s,
-                            .y2 = (bar_top + buf_h) * s});
+          &(pixman_box32_t){.x1 = x1 * s, .x2 = x2 * s, .y1 = g_rt->bar_top * s,
+                            .y2 = (g_rt->bar_top + buf_h) * s});
     }
     uint32_t text_x = x1 + st->pad_l;
     if (st->center) {
@@ -1019,7 +1035,7 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
       return 0;
     ModuleEntry *me = &ents[n++];
     *me = (ModuleEntry){.text = texts[(*text_n)++],
-                        .st = &st_custom[ci],
+                        .st = &g_rt->st_custom[ci],
                         .module = names[(*name_n)++],
                         .tag = -1};
     int ml = module_max_length(me->module);
@@ -1050,7 +1066,7 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
     format_battery(module_fmt(bc->name, bc->fmt, bar), bar->battery_pct[bi],
                    bar->battery_status[bi], icon,
                    bar->battery_on_ac[bi] ? bc->icon_ac : "", dst, 256);
-    ents[n++] = (ModuleEntry){.text = dst, .st = &st_battery,
+    ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_battery,
                               .module = bc->name, .tag = -1};
     return n;
   }
@@ -1060,7 +1076,7 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
     if (bar->overview_mode) {
       if (max > 0)
         ents[n++] = (ModuleEntry){.text = g_cfg.overview_label,
-                                  .st = &st_overview, .module = "tags",
+                                  .st = &g_rt->st_overview, .module = "tags",
                                   .tag = -1};
     } else {
       for (int i = 0; i < bar->tag_count && n < max; i++) {
@@ -1069,17 +1085,17 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
           continue;
         ModuleStyle *st;
         if (bar->urg & (1 << i))
-          st = &st_tags[2];
+          st = &g_rt->st_tags[2];
         else if (bar->mtags & (1 << i))
-          st = &st_tags[0];
+          st = &g_rt->st_tags[0];
         else if (bar->ctags & (1 << i))
-          st = &st_tags[1];
+          st = &g_rt->st_tags[1];
         else
-          st = &st_tags[3];
+          st = &g_rt->st_tags[3];
         if (bar->hover_tag == i) {
-          st_tags_hover_scratch = *st;
-          apply_css_resolved(&st_tags_hover_scratch, st_tag_hover_css);
-          st = &st_tags_hover_scratch;
+          g_rt->st_tags_hover_scratch = *st;
+          apply_css_resolved(&g_rt->st_tags_hover_scratch, g_rt->st_tag_hover_css);
+          st = &g_rt->st_tags_hover_scratch;
         }
         ents[n++] = (ModuleEntry){.text = g_cfg.tag_names[i], .st = st,
                                   .module = "tags", .tag = i};
@@ -1089,14 +1105,14 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
   case M_LAYOUT:
     dst = texts[(*text_n)++];
     format_value(g_cfg.layout_format, bar->layout, "", dst, 256);
-    ents[n++] = (ModuleEntry){.text = dst, .st = &st_layout,
+    ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_layout,
                               .module = "layout", .tag = -1};
     break;
   case M_TITLE:
     if (bar->title[0]) {
       dst = texts[(*text_n)++];
       format_value(g_cfg.title_format, bar->title, "", dst, 256);
-      ents[n++] = (ModuleEntry){.text = dst, .st = &st_title,
+      ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_title,
                                 .module = "title", .tag = -1};
     }
     break;
@@ -1109,9 +1125,9 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
       dst = texts[(*text_n)++];
       format_value_full(module_fmt("cpu", g_cfg.cpu_format, bar), usagestr,
                         loadstr, "", dst, 256);
-      ents[n++] = (ModuleEntry){.text = dst, .st = &st_cpu,
+      ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_cpu,
                                 .module = "cpu", .tag = -1};
-      ensure_numeric_min_width(&st_cpu, module_fmt("cpu", g_cfg.cpu_format, bar),
+      ensure_numeric_min_width(&g_rt->st_cpu, module_fmt("cpu", g_cfg.cpu_format, bar),
                                "");
     }
     break;
@@ -1119,9 +1135,9 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
     dst = texts[(*text_n)++];
     format_int(module_fmt("mem", g_cfg.mem_format, bar), bar->mem_pct, "", dst,
                256);
-    ents[n++] = (ModuleEntry){.text = dst, .st = &st_mem, .module = "mem",
+    ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_mem, .module = "mem",
                               .tag = -1};
-    ensure_numeric_min_width(&st_mem, module_fmt("mem", g_cfg.mem_format, bar),
+    ensure_numeric_min_width(&g_rt->st_mem, module_fmt("mem", g_cfg.mem_format, bar),
                              "");
     break;
   case M_BRIGHTNESS:
@@ -1132,9 +1148,9 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
       dst = texts[(*text_n)++];
       format_int(module_fmt("brightness", g_cfg.brightness_fmt, bar),
                  bar->brightness_pct, bicon, dst, 256);
-      ents[n++] = (ModuleEntry){.text = dst, .st = &st_brightness,
+      ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_brightness,
                                 .module = "brightness", .tag = -1};
-      ensure_numeric_min_width(&st_brightness,
+      ensure_numeric_min_width(&g_rt->st_brightness,
                                module_fmt("brightness",
                                           g_cfg.brightness_fmt, bar),
                                bicon);
@@ -1160,7 +1176,7 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
       dst = texts[(*text_n)++];
       format_volume(fmt, bar->volume_pct, icon,
                     bar->volume_bt ? g_cfg.volume_bt_icon : "", dst, 256);
-      ents[n++] = (ModuleEntry){.text = dst, .st = &st_volume,
+      ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_volume,
                                 .module = "volume", .tag = -1};
       // Reserve room for two-digit values, but never for the {bt} mark.
       char wt[256];
@@ -1168,38 +1184,38 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
                     level_icon(g_cfg.volume_icons, g_cfg.volume_icon_count,
                                bar->volume_pct),
                     "", wt, sizeof(wt));
-      ensure_module_min_width(&st_volume, wt);
+      ensure_module_min_width(&g_rt->st_volume, wt);
       format_volume(g_cfg.volume_fmt_muted, 88, g_cfg.volume_muted_icon, "",
                     wt, sizeof(wt));
-      ensure_module_min_width(&st_volume, wt);
+      ensure_module_min_width(&g_rt->st_volume, wt);
     }
     break;
   case M_CLOCK_TIME:
     dst = texts[(*text_n)++];
     strftime(dst, 256, module_fmt("clock", g_cfg.clock_time_format, bar),
              tm);
-    ents[n++] = (ModuleEntry){.text = dst, .st = &st_clock, .module = "clock",
+    ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_clock, .module = "clock",
                               .tag = -1};
     break;
   case M_CLOCK_DATE:
     dst = texts[(*text_n)++];
     strftime(dst, 256, module_fmt("clock.date", g_cfg.clock_date_format, bar),
              tm);
-    ents[n++] = (ModuleEntry){.text = dst, .st = &st_clock_date,
+    ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_clock_date,
                               .module = "clock.date", .tag = -1};
     break;
   case M_KEYMODE:
     dst = texts[(*text_n)++];
     format_value(module_fmt("keymode", g_cfg.keymode_format, bar), bar->keymode,
                  "", dst, 256);
-    ents[n++] = (ModuleEntry){.text = dst, .st = &st_keymode,
+    ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_keymode,
                               .module = "keymode", .tag = -1};
     break;
   case M_KBLAYOUT:
     dst = texts[(*text_n)++];
     format_value(module_fmt("keyboardlayout", g_cfg.keyboardlayout_format, bar),
                  bar->kb_layout, "", dst, 256);
-    ents[n++] = (ModuleEntry){.text = dst, .st = &st_keyboardlayout,
+    ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_keyboardlayout,
                               .module = "keyboardlayout", .tag = -1};
     break;
   case M_NETWORK:
@@ -1215,7 +1231,7 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
       } else {
         format_value(g_cfg.network_format, bar->net_ifname, "", dst, 256);
       }
-      ents[n++] = (ModuleEntry){.text = dst, .st = &st_network,
+      ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_network,
                                 .module = "network", .tag = -1};
     }
     break;
@@ -1224,7 +1240,7 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
       dst = texts[(*text_n)++];
       format_int(module_fmt("hideclients", g_cfg.hide_clients_format, bar),
                  bar->hideclients, "", dst, 256);
-      ents[n++] = (ModuleEntry){.text = dst, .st = &st_hide_clients,
+      ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_hide_clients,
                                 .module = "hideclients", .tag = -1};
     }
     break;
@@ -1234,16 +1250,16 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
       if (tray && tray_visible_items(tray, &tvis) && tvis > 0) {
         int tsize = g_cfg.tray_icon_size > 0
                         ? g_cfg.tray_icon_size
-                        : (int)bar_h - 2 * g_cfg.tray_pad;
+                        : (int)g_rt->bar_h - 2 * g_cfg.tray_pad;
         if (tsize < 8)
           tsize = 8;
-        if (tsize > (int)bar_h - 2 * g_cfg.tray_pad)
-          tsize = (int)bar_h - 2 * g_cfg.tray_pad;
+        if (tsize > (int)g_rt->bar_h - 2 * g_cfg.tray_pad)
+          tsize = (int)g_rt->bar_h - 2 * g_cfg.tray_pad;
         uint32_t tw = (uint32_t)(tvis * tsize + (tvis - 1) * g_cfg.tray_gap +
-                                 st_tray.pad_l + st_tray.pad_r +
-                                 st_tray.margin_l + st_tray.margin_r);
+                                 g_rt->st_tray.pad_l + g_rt->st_tray.pad_r +
+                                 g_rt->st_tray.margin_l + g_rt->st_tray.margin_r);
         ents[n++] = (ModuleEntry){.module = "tray",
-                                  .st = &st_tray,
+                                  .st = &g_rt->st_tray,
                                   .tag = -1,
                                   .is_tray = true,
                                   .width = tw,
@@ -1319,57 +1335,57 @@ static uint32_t draw_tray_entry(Bar *bar, const ModuleEntry *e, uint32_t x,
                                 uint32_t max_x, uint32_t buf_h) {
   int count = 0;
   MangobarTrayItem **items = tray_visible_items(tray, &count);
-  uint32_t tray_x1 = x + st_tray.margin_l;
-  uint32_t tray_body_w = e->width - st_tray.margin_l - st_tray.margin_r;
+  uint32_t tray_x1 = x + g_rt->st_tray.margin_l;
+  uint32_t tray_body_w = e->width - g_rt->st_tray.margin_l - g_rt->st_tray.margin_r;
   if (tray_x1 + tray_body_w > max_x)
     tray_body_w = max_x > tray_x1 ? max_x - tray_x1 : 0;
   if (bar_bg_cr && tray_body_w > 0) {
     cairo_pattern_t *pat = NULL;
-    if (st_tray.bg_gradient) {
-      double x1d = (double)tray_x1, y1d = (double)bar_top;
-      double x2d = (double)(tray_x1 + tray_body_w), y2d = (double)bar_top;
-      if (st_tray.gradient_dir == 1) { // to top: vertical, bottom -> top
+    if (g_rt->st_tray.bg_gradient) {
+      double x1d = (double)tray_x1, y1d = (double)g_rt->bar_top;
+      double x2d = (double)(tray_x1 + tray_body_w), y2d = (double)g_rt->bar_top;
+      if (g_rt->st_tray.gradient_dir == 1) { // to top: vertical, bottom -> top
         x2d = x1d;
-        y1d = (double)(bar_top + buf_h);
-        y2d = (double)bar_top;
-      } else if (st_tray.gradient_dir == 2) { // to left: right -> left
+        y1d = (double)(g_rt->bar_top + buf_h);
+        y2d = (double)g_rt->bar_top;
+      } else if (g_rt->st_tray.gradient_dir == 2) { // to left: right -> left
         y2d = y1d;
         x1d = (double)(tray_x1 + tray_body_w);
         x2d = (double)tray_x1;
-      } else if (st_tray.gradient_dir == 3) { // to right: left -> right
+      } else if (g_rt->st_tray.gradient_dir == 3) { // to right: left -> right
         y2d = y1d;
       } else { // to bottom: vertical, top -> bottom
         x2d = x1d;
-        y2d = (double)(bar_top + buf_h);
+        y2d = (double)(g_rt->bar_top + buf_h);
       }
       double r0, g0, b0, a0, r1, g1, b1, a1;
-      pixman_color_to_doubles(&st_tray.bg, &r0, &g0, &b0, &a0);
-      pixman_color_to_doubles(&st_tray.gradient_end, &r1, &g1, &b1, &a1);
+      pixman_color_to_doubles(&g_rt->st_tray.bg, &r0, &g0, &b0, &a0);
+      pixman_color_to_doubles(&g_rt->st_tray.gradient_end, &r1, &g1, &b1, &a1);
       pat = cairo_pattern_create_linear(x1d, y1d, x2d, y2d);
       cairo_pattern_add_color_stop_rgba(pat, 0.0, r0, g0, b0, a0);
       cairo_pattern_add_color_stop_rgba(pat, 1.0, r1, g1, b1, a1);
       cairo_set_source(bar_bg_cr, pat);
     } else {
       double tr, tg, tb, ta;
-      pixman_color_to_doubles(&st_tray.bg, &tr, &tg, &tb, &ta);
+      pixman_color_to_doubles(&g_rt->st_tray.bg, &tr, &tg, &tb, &ta);
       cairo_set_source_rgba(bar_bg_cr, tr, tg, tb, ta);
     }
-    cairo_rounded_rect(bar_bg_cr, tray_x1, bar_top, (double)tray_body_w,
-                       (double)buf_h, module_radius(&st_tray, buf_h));
+    cairo_rounded_rect(bar_bg_cr, tray_x1, g_rt->bar_top, (double)tray_body_w,
+                       (double)buf_h, module_radius(&g_rt->st_tray, buf_h));
     cairo_fill(bar_bg_cr);
     if (pat)
       cairo_pattern_destroy(pat);
   }
   uint32_t cur = tray_x1;
-  int tpad = st_tray.pad_l > 0 ? st_tray.pad_l : g_cfg.tray_pad;
+  int tpad = g_rt->st_tray.pad_l > 0 ? g_rt->st_tray.pad_l : g_cfg.tray_pad;
   int tsize = e->tray_icon_size;
   for (int i = 0; i < count; i++) {
     int dx = (int)cur + tpad;
-    int dy = bar_top + ((int)buf_h - tsize) / 2;
+    int dy = g_rt->bar_top + ((int)buf_h - tsize) / 2;
     draw_tray_icon(bg, tray_item_icon(items[i]), tsize, dx, dy);
     record_tray_hotspot(bar, items[i], (uint32_t)cur,
                         (uint32_t)(cur + (uint32_t)tsize + (uint32_t)tpad +
-                                   st_tray.pad_r));
+                                   g_rt->st_tray.pad_r));
     cur += (uint32_t)(tsize + g_cfg.tray_gap);
   }
   return x + e->width;
@@ -1387,6 +1403,10 @@ static uint32_t draw_module_entry(Bar *bar, const ModuleEntry *e, uint32_t x,
 
 static void draw_bar(Bar *bar) {
   IPC_LOG("[draw] %s enter\n", bar->name);
+  if (!bar->profile || !bar->rt)
+    return; // pending output without a matched profile
+  g_rt = bar->rt;
+  g_cfg_ptr = &bar->profile->config;
   g_draw_scale = bar->scale > 0 ? (uint32_t)bar->scale : 1;
   g_draw_font = font_for_scale(bar->scale);
   int fd = allocate_shm_file(bar->bufsize);
@@ -1445,7 +1465,7 @@ static void draw_bar(Bar *bar) {
   bar->hotspot_count = 0;
   bar->tray_hotspot_count = 0;
 
-  uint32_t y = (uint32_t)bar_top + (bar_h + font->ascent - font->descent) / 2;
+  uint32_t y = (uint32_t)g_rt->bar_top + (g_rt->bar_h + font->ascent - font->descent) / 2;
 
   // --- Build right modules (width known before left/center layout) ---
   ModuleEntry right_ents[MAX_MODULE_ENTRIES];
@@ -1464,7 +1484,7 @@ static void draw_bar(Bar *bar) {
   }
 
   uint32_t logical_w = bar->width / (bar->scale > 0 ? (uint32_t)bar->scale : 1);
-  uint32_t right_edge = logical_w > bar_right ? logical_w - bar_right : 0;
+  uint32_t right_edge = logical_w > g_rt->bar_right ? logical_w - g_rt->bar_right : 0;
   // Right group right-aligned
   uint32_t right_group_left =
       right_edge > right_total_w ? right_edge - right_total_w : 0;
@@ -1496,9 +1516,9 @@ static void draw_bar(Bar *bar) {
   uint32_t center_left = 0, center_right = 0, center_max = 0;
   uint32_t center_title_avail = 0;
   if (center_n > 0) {
-    uint32_t usable = right_edge > bar_left ? right_edge - bar_left : 0;
-    center_left = center_cw < usable ? bar_left + (usable - center_cw) / 2
-                                     : bar_left;
+    uint32_t usable = right_edge > g_rt->bar_left ? right_edge - g_rt->bar_left : 0;
+    center_left = center_cw < usable ? g_rt->bar_left + (usable - center_cw) / 2
+                                     : g_rt->bar_left;
     center_right = center_left + center_cw;
     center_max = center_right < right_edge ? center_right : right_edge;
     if (center_has_title) {
@@ -1541,13 +1561,13 @@ static void draw_bar(Bar *bar) {
   uint32_t title_avail = 0;
   if (has_title) {
     uint32_t space = 0;
-    if (left_max > bar_left && left_max - bar_left > fixed_left_w)
-      space = left_max - bar_left - fixed_left_w;
+    if (left_max > g_rt->bar_left && left_max - g_rt->bar_left > fixed_left_w)
+      space = left_max - g_rt->bar_left - fixed_left_w;
     uint32_t title_min = title_w < 48 ? title_w : 48;
     title_avail = space > title_min ? space : title_min;
   }
 
-  uint32_t x = bar_left;
+  uint32_t x = g_rt->bar_left;
   for (int i = 0; i < left_n && x < left_max; i++) {
     const char *text = scratch[i].text;
     char fit[256];
@@ -1566,7 +1586,7 @@ static void draw_bar(Bar *bar) {
     }
     ModuleEntry me = scratch[i];
     me.text = text;
-    x = draw_module_entry(bar, &me, x, y, fg, fg_mask, bg, left_max, bar_h);
+    x = draw_module_entry(bar, &me, x, y, fg, fg_mask, bg, left_max, g_rt->bar_h);
   }
   uint32_t left_end = x;
 
@@ -1593,9 +1613,9 @@ static void draw_bar(Bar *bar) {
   if (right_start > left_end) {
     uint32_t s = bar->scale > 0 ? (uint32_t)bar->scale : 1;
     pixman_image_fill_boxes(
-        PIXMAN_OP_SRC, bg, bar->sel ? &st_bar_sel.bg : &st_bar.bg, 1,
+        PIXMAN_OP_SRC, bg, bar->sel ? &g_rt->st_bar_sel.bg : &g_rt->st_bar.bg, 1,
         &(pixman_box32_t){.x1 = left_end * s, .x2 = right_start * s,
-                          .y1 = bar_top * s, .y2 = (bar_top + bar_h) * s});
+                          .y1 = g_rt->bar_top * s, .y2 = (g_rt->bar_top + g_rt->bar_h) * s});
   }
 
   // --- Center modules (drawn at the true screen center) ---
@@ -1621,7 +1641,7 @@ static void draw_bar(Bar *bar) {
       ModuleEntry me = center_ents[i];
       me.text = text;
       cx = draw_module_entry(bar, &me, cx, y, fg, fg_mask, bg, center_max,
-                             bar_h);
+                             g_rt->bar_h);
     }
   }
 
@@ -1631,7 +1651,7 @@ static void draw_bar(Bar *bar) {
     if (cur_x >= right_edge)
       break;
     cur_x = draw_module_entry(bar, &right_ents[i], cur_x, y, fg, fg_mask, bg,
-                              right_edge, bar_h);
+                              right_edge, g_rt->bar_h);
   }
 
   if (bar_bg_cr) {
@@ -1715,9 +1735,11 @@ static void wl_output_done(void *data, struct wl_output *output) {
 static void wl_output_scale(void *data, struct wl_output *output,
                             int32_t factor) {
   Bar *bar = data;
-  int scale = factor > 0 ? factor : 1;
-  if (g_cfg.buffer_scale > 1)
-    scale *= g_cfg.buffer_scale;
+  bar->wl_scale = factor > 0 ? factor : 1;
+  int bscale = bar->profile ? bar->profile->config.buffer_scale : 1;
+  if (bscale < 1)
+    bscale = 1;
+  int scale = bar->wl_scale * bscale;
   if (scale == bar->scale)
     return;
   bar->scale = scale;
@@ -1737,11 +1759,78 @@ static const struct wl_output_listener wl_output_listener = {
     .scale = wl_output_scale,
 };
 
+// Force a profile's custom modules to run on the next refresh.
+static void profile_custom_force_refresh(MangoConfigProfile *profile);
+
+// Destroy the layer surface for a bar, if any.
+static void bar_destroy_surface(Bar *bar) {
+  if (bar->layer_surface) {
+    zwlr_layer_surface_v1_destroy(bar->layer_surface);
+    bar->layer_surface = NULL;
+  }
+  if (bar->wl_surface) {
+    wl_surface_destroy(bar->wl_surface);
+    bar->wl_surface = NULL;
+  }
+  bar->configured = false;
+  bar->active = false;
+}
+
+// Create the layer surface for a bar after its profile has been matched.
+static void bar_create_surface(Bar *bar) {
+  const MangoConfig *cfg = &bar->profile->config;
+  ProfileRuntime *rt = bar->rt;
+  int bscale = cfg->buffer_scale > 0 ? cfg->buffer_scale : 1;
+  // The compositor may have reported wl_output.scale before the xdg-output
+  // name arrived; keep that factor instead of starting over from 1.
+  bar->scale = bar->wl_scale * bscale;
+  bar->tag_count = cfg->tag_count;
+  bar->height = (rt->bar_h + rt->bar_top) * (uint32_t)bar->scale;
+  bar->wl_surface = wl_compositor_create_surface(compositor);
+  bar->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+      layer_shell, bar->wl_surface, bar->wl_output, cfg->layer, "mangobar");
+  zwlr_layer_surface_v1_add_listener(bar->layer_surface,
+                                     &layer_surface_listener, bar);
+  zwlr_layer_surface_v1_set_size(bar->layer_surface, 0,
+                                 rt->bar_h + rt->bar_top);
+  zwlr_layer_surface_v1_set_anchor(bar->layer_surface,
+                                   ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                                       ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+                                       ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+  zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface,
+                                           rt->bar_h + rt->bar_top);
+  wl_surface_commit(bar->wl_surface);
+  bar->active = true;
+}
+
 static void output_name_handler(void *data, struct zxdg_output_v1 *xdg_output,
                                 const char *name) {
   Bar *bar = data;
   free(bar->name);
   bar->name = strdup(name);
+
+  // Match a profile now that the stable output name is known.
+  MangoConfigProfile *profile = NULL;
+  MangoConfigMatch m = mango_config_set_match(&g_config_set, name, &profile);
+  if (m == MANGO_CONFIG_MATCH_ENABLED && profile) {
+    if (bar->active && bar->profile == profile)
+      return; // repeated/unchanged name event; keep the running bar
+    if (bar->active)
+      bar_destroy_surface(bar); // output changed to another profile
+    bar->profile = profile;
+    bar->rt = &g_runtimes[profile - g_config_set.profiles];
+    bar_create_surface(bar);
+    profile_custom_force_refresh(profile);
+  } else if (bar->active) {
+    // The output stopped matching any profile: remove its bar.
+    bar_destroy_surface(bar);
+    bar->profile = NULL;
+    bar->rt = NULL;
+  } else {
+    // Unmatched output: keep the listener record but no surface.
+    bar->profile = NULL;
+    bar->rt = NULL;
+  }
 }
 
 static void output_logical_position(void *data,
@@ -1784,45 +1873,68 @@ static void registry_global(void *data, struct wl_registry *registry,
   else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0)
     layer_shell =
         wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface, 1);
-  else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0)
+  else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
     output_manager =
         wl_registry_bind(registry, name, &zxdg_output_manager_v1_interface, 2);
+    // wl_output may have been announced before the xdg-output manager.
+    Bar *b;
+    wl_list_for_each(b, &bar_list, link) {
+      if (!b->xdg_output) {
+        b->xdg_output =
+            zxdg_output_manager_v1_get_xdg_output(output_manager, b->wl_output);
+        zxdg_output_v1_add_listener(b->xdg_output, &output_listener, b);
+      }
+    }
+  }
   else if (strcmp(interface, wl_seat_interface.name) == 0) {
     seat = wl_registry_bind(registry, name, &wl_seat_interface, 7);
     pointer = wl_seat_get_pointer(seat);
     wl_pointer_add_listener(pointer, &pointer_listener, NULL);
   } else if (strcmp(interface, wl_output_interface.name) == 0) {
+    // Defer surface creation until the xdg-output name arrives so the profile
+    // can be matched first.
     Bar *bar = calloc(1, sizeof(Bar));
     bar->registry_name = name;
     bar->hover_tag = -1;
+    bar->active = false;
     bar->wl_output = wl_registry_bind(registry, name, &wl_output_interface, 2);
     wl_output_add_listener(bar->wl_output, &wl_output_listener, bar);
-    bar->xdg_output =
-        zxdg_output_manager_v1_get_xdg_output(output_manager, bar->wl_output);
-    zxdg_output_v1_add_listener(bar->xdg_output, &output_listener, bar);
-    bar->scale = g_cfg.buffer_scale > 0 ? g_cfg.buffer_scale : 1;
-    bar->tag_count = g_cfg.tag_count;
-    bar->height = (bar_h + bar_top) * (uint32_t)bar->scale;
-    bar->wl_surface = wl_compositor_create_surface(compositor);
-    bar->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
-        layer_shell, bar->wl_surface, bar->wl_output, g_cfg.layer, "mangobar");
-    zwlr_layer_surface_v1_add_listener(bar->layer_surface,
-                                       &layer_surface_listener, bar);
-    zwlr_layer_surface_v1_set_size(bar->layer_surface, 0,
-                                   bar_h + bar_top);
-    zwlr_layer_surface_v1_set_anchor(bar->layer_surface,
-                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                         ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-                                         ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-    zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface,
-                                             bar_h + bar_top);
-    wl_surface_commit(bar->wl_surface);
+    if (output_manager) {
+      bar->xdg_output =
+          zxdg_output_manager_v1_get_xdg_output(output_manager, bar->wl_output);
+      zxdg_output_v1_add_listener(bar->xdg_output, &output_listener, bar);
+    }
+    bar->scale = 1;
+    bar->wl_scale = 1;
+    bar->tag_count = MANGOBAR_MAX_TAGS;
     wl_list_insert(&bar_list, &bar->link);
   }
 }
 
+// Called when the menu/popup state references an output that is going away.
+static void menu_output_removed(struct wl_output *output);
+
 static void registry_global_remove(void *data, struct wl_registry *registry,
                                    uint32_t name) {
+  Bar *bar, *tmp;
+  wl_list_for_each_safe(bar, tmp, &bar_list, link) {
+    if (bar->registry_name != name)
+      continue;
+    // Clear pointer state referencing this bar.
+    if (pointer_bar == bar)
+      pointer_bar = NULL;
+    menu_output_removed(bar->wl_output);
+    // Destroy Wayland resources.
+    bar_destroy_surface(bar);
+    if (bar->xdg_output)
+      zxdg_output_v1_destroy(bar->xdg_output);
+    if (bar->wl_output)
+      wl_output_destroy(bar->wl_output);
+    wl_list_remove(&bar->link);
+    free(bar->name);
+    free(bar);
+    return;
+  }
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -2136,6 +2248,8 @@ static bool scroll_debounced(const char *module) {
 
 static void handle_module_action(Bar *bar, const char *module, int tag,
                                  uint32_t button) {
+  if (bar->profile)
+    g_cfg_ptr = &bar->profile->config;
   // Left click toggles format-alt when the module defines one.
   int ai = alt_index(module);
   if (ai >= 0 && button == BTN_LEFT) {
@@ -2206,6 +2320,8 @@ static void menu_open(Bar *bar, MangobarTrayItem *item, double lx, double ly);
 static void tray_right_click(Bar *bar, double x, double y);
 
 static double smooth_scroll_threshold_at(const Bar *bar, double x) {
+  if (bar->profile)
+    g_cfg_ptr = &bar->profile->config;
   for (int i = 0; i < bar->hotspot_count; i++) {
     const Hotspot *h = &bar->hotspots[i];
     if (x >= h->x1 && x < h->x2) {
@@ -2222,6 +2338,8 @@ static void dispatch_pointer_event(Bar *bar, double x, double y,
                                    uint32_t button) {
   if (!bar)
     return;
+  if (bar->profile)
+    g_cfg_ptr = &bar->profile->config;
   for (int i = 0; i < bar->tray_hotspot_count; i++) {
     TrayHotspot *h = &bar->tray_hotspots[i];
     if (x >= h->x1 && x < h->x2) {
@@ -2315,6 +2433,15 @@ static void menu_close(void) {
   pointer_on_sub = false;
 }
 
+static void menu_output_removed(struct wl_output *output) {
+  if (popup.pending_bar && popup.pending_bar->wl_output == output) {
+    popup.pending_item = NULL;
+    popup.pending_bar = NULL;
+  }
+  if (popup.open && popup.output == output)
+    menu_close();
+}
+
 static uint64_t now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -2399,7 +2526,7 @@ static PangoFontDescription *build_menu_font(void) {
   int size = 12;
   bool bold = false;
   const char *p = g_style_sheet.font_family[0] ? g_style_sheet.font_family
-                                               : g_cfg.font;
+                                               : g_config_set.profiles[0].config.font;
   const char *colon = strchr(p, ':');
   if (colon) {
     size_t n = (size_t)(colon - p);
@@ -3364,55 +3491,60 @@ static int cpu_prev_total, cpu_prev_idle;
 static uint64_t last_cpu_ms;
 
 static void update_brightness() {
-  static char dev[64];
-  static bool dev_init = false;
-  if (!dev_init) {
-    dev_init = true;
-    if (g_cfg.brightness_dev[0]) {
-      strncpy(dev, g_cfg.brightness_dev, sizeof(dev) - 1);
-      dev[sizeof(dev) - 1] = '\0';
-    } else {
-      DIR *d = opendir("/sys/class/backlight");
-      if (d) {
-        struct dirent *e;
-        while ((e = readdir(d))) {
-          if (e->d_name[0] == '.')
-            continue;
-          char mb[512];
-          snprintf(mb, sizeof(mb), "/sys/class/backlight/%s/max_brightness",
-                   e->d_name);
-          struct stat st;
-          if (stat(mb, &st) == 0) {
-            strncpy(dev, e->d_name, sizeof(dev) - 1);
-            dev[sizeof(dev) - 1] = '\0';
-            break;
+  Bar *bar;
+  wl_list_for_each(bar, &bar_list, link) {
+    if (!bar->profile || !bar->rt)
+      continue;
+    ProfileRuntime *rt = bar->rt;
+    const MangoConfig *cfg = &bar->profile->config;
+    if (!rt->brightness_dev_init) {
+      rt->brightness_dev_init = true;
+      if (cfg->brightness_dev[0]) {
+        snprintf(rt->brightness_dev, sizeof(rt->brightness_dev), "%.63s",
+                 cfg->brightness_dev);
+      } else {
+        DIR *d = opendir("/sys/class/backlight");
+        if (d) {
+          struct dirent *e;
+          while ((e = readdir(d))) {
+            if (e->d_name[0] == '.')
+              continue;
+            char mb[512];
+            snprintf(mb, sizeof(mb), "/sys/class/backlight/%s/max_brightness",
+                     e->d_name);
+            struct stat st;
+            if (stat(mb, &st) == 0) {
+              snprintf(rt->brightness_dev, sizeof(rt->brightness_dev),
+                       "%.63s", e->d_name);
+              break;
+            }
           }
+          closedir(d);
         }
-        closedir(d);
       }
     }
+    if (!rt->brightness_dev[0])
+      continue;
+    char p[256], mp[256];
+    snprintf(p, sizeof(p), "/sys/class/backlight/%s/brightness",
+             rt->brightness_dev);
+    snprintf(mp, sizeof(mp), "/sys/class/backlight/%s/max_brightness",
+             rt->brightness_dev);
+    long b = 0, mb = 0;
+    FILE *f = fopen(p, "r");
+    if (f) {
+      if (fscanf(f, "%ld", &b) != 1)
+        b = 0;
+      fclose(f);
+    }
+    FILE *f2 = fopen(mp, "r");
+    if (f2) {
+      if (fscanf(f2, "%ld", &mb) != 1)
+        mb = 0;
+      fclose(f2);
+    }
+    bar->brightness_pct = mb ? (int)(b * 100 / mb) : 0;
   }
-  if (!dev[0])
-    return;
-  char p[256], mp[256];
-  snprintf(p, sizeof(p), "/sys/class/backlight/%s/brightness", dev);
-  snprintf(mp, sizeof(mp), "/sys/class/backlight/%s/max_brightness", dev);
-  long b = 0, mb = 0;
-  FILE *f = fopen(p, "r");
-  if (f) {
-    if (fscanf(f, "%ld", &b) != 1)
-      b = 0;
-    fclose(f);
-  }
-  FILE *f2 = fopen(mp, "r");
-  if (f2) {
-    if (fscanf(f2, "%ld", &mb) != 1)
-      mb = 0;
-    fclose(f2);
-  }
-  int pct = mb ? (int)(b * 100 / mb) : 0;
-  Bar *bar;
-  wl_list_for_each(bar, &bar_list, link) bar->brightness_pct = pct;
 }
 
 // Create the udev backlight monitor (called once).
@@ -3443,10 +3575,16 @@ static void udev_dispatch(void) {
     return;
   const char *action = udev_device_get_action(dev);
   const char *sysname = udev_device_get_sysname(dev);
-  if (action && strcmp(action, "change") == 0 && sysname &&
-      (!g_cfg.brightness_dev[0] ||
-       strcmp(sysname, g_cfg.brightness_dev) == 0))
-    brightness_dirty = true;
+  if (action && strcmp(action, "change") == 0 && sysname) {
+    for (size_t i = 0; i < g_config_set.count; i++) {
+      const MangoConfig *cfg = &g_config_set.profiles[i].config;
+      if (!cfg->brightness_dev[0] ||
+          strcmp(sysname, cfg->brightness_dev) == 0) {
+        brightness_dirty = true;
+        break;
+      }
+    }
+  }
   udev_device_unref(dev);
 }
 
@@ -3701,8 +3839,8 @@ static void update_volume() {
         snd_mixer_selem_id_t *sid = NULL;
         snd_mixer_selem_id_malloc(&sid);
         if (sid) {
-          snd_mixer_selem_id_set_index(sid, g_cfg.volume_mix_index);
-          snd_mixer_selem_id_set_name(sid, g_cfg.volume_ctrl);
+          snd_mixer_selem_id_set_index(sid, g_config_set.profiles[0].config.volume_mix_index);
+          snd_mixer_selem_id_set_name(sid, g_config_set.profiles[0].config.volume_ctrl);
           snd_mixer_elem_t *elem = snd_mixer_find_selem(handle, sid);
           long minv = 0, maxv = 0;
           if (elem && snd_mixer_selem_get_playback_volume_range(elem, &minv,
@@ -3831,8 +3969,11 @@ static void update_battery(void) {
 
   Bar *b;
   wl_list_for_each(b, &bar_list, link) {
-    for (int i = 0; i < g_cfg.battery_count; i++) {
-      const MangoBatteryCfg *bc = &g_cfg.batteries[i];
+    if (!b->profile)
+      continue;
+    const MangoConfig *cfg = &b->profile->config;
+    for (int i = 0; i < cfg->battery_count; i++) {
+      const MangoBatteryCfg *bc = &cfg->batteries[i];
       int idx = -1;
       if (bc->device[0]) {
         for (int j = 0; j < n; j++)
@@ -3949,21 +4090,43 @@ static bool run_custom_module(MangoCustomModule *cm) {
   return true;
 }
 
+// Whether any active bar currently uses this profile.
+static bool profile_has_active_bar(const MangoConfigProfile *profile) {
+  Bar *b;
+  wl_list_for_each(b, &bar_list, link)
+    if (b->active && b->profile == profile)
+      return true;
+  return false;
+}
+
+// Force a profile's custom modules to run on the next refresh.
+static void profile_custom_force_refresh(MangoConfigProfile *profile) {
+  MangoConfig *cfg = &profile->config;
+  for (int i = 0; i < cfg->custom_count; i++)
+    cfg->customs[i].last_run_ms = 0;
+}
+
 // Refresh due custom modules; returns true when any output changed.
 static bool update_custom_modules(void) {
   bool changed = false;
   uint64_t now = now_ms();
-  for (int i = 0; i < g_cfg.custom_count; i++) {
-    MangoCustomModule *cm = &g_cfg.customs[i];
-    if (!cm->enabled || !cm->exec[0])
+  for (size_t pi = 0; pi < g_config_set.count; pi++) {
+    MangoConfigProfile *profile = &g_config_set.profiles[pi];
+    if (!profile_has_active_bar(profile))
       continue;
-    bool sig_dirty = custom_signal_dirty[i];
-    custom_signal_dirty[i] = 0;
-    uint64_t due = (uint64_t)(cm->interval > 0 ? cm->interval : 0) * 1000u;
-    if (sig_dirty || cm->last_run_ms == 0 ||
-        (due > 0 && now - cm->last_run_ms >= due)) {
-      if (run_custom_module(cm))
-        changed = true;
+    MangoConfig *cfg = &profile->config;
+    for (int i = 0; i < cfg->custom_count; i++) {
+      MangoCustomModule *cm = &cfg->customs[i];
+      if (!cm->enabled || !cm->exec[0])
+        continue;
+      bool sig_dirty = custom_signal_dirty[pi][i];
+      custom_signal_dirty[pi][i] = 0;
+      uint64_t due = (uint64_t)(cm->interval > 0 ? cm->interval : 0) * 1000u;
+      if (sig_dirty || cm->last_run_ms == 0 ||
+          (due > 0 && now - cm->last_run_ms >= due)) {
+        if (run_custom_module(cm))
+          changed = true;
+      }
     }
   }
   return changed;
@@ -3976,10 +4139,8 @@ static void tray_set_dirty() {
 
 static void custom_signal_handler(int signo) {
   for (int i = 0; i < custom_signal_count; i++) {
-    if (custom_signal_map[i].signo == signo) {
-      custom_signal_dirty[custom_signal_map[i].ci] = 1;
-      break;
-    }
+    if (custom_signal_map[i].signo == signo)
+      custom_signal_dirty[custom_signal_map[i].pi][custom_signal_map[i].ci] = 1;
   }
   if (signal_fd >= 0) {
     uint64_t one = 1;
@@ -3993,29 +4154,34 @@ static void register_custom_signals(void) {
   signal_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (signal_fd < 0)
     return;
-  for (int i = 0; i < g_cfg.custom_count; i++) {
-    MangoCustomModule *cm = &g_cfg.customs[i];
-    if (!cm->enabled || cm->signal <= 0)
-      continue;
-    int signo = SIGRTMIN + cm->signal;
-    if (signo > SIGRTMAX) {
-      IPC_LOG("[signal] custom-%s: signal %d out of range (max %d)\n",
-              cm->name, cm->signal, SIGRTMAX - SIGRTMIN);
-      continue;
+  for (size_t pi = 0; pi < g_config_set.count; pi++) {
+    MangoConfig *cfg = &g_config_set.profiles[pi].config;
+    for (int i = 0; i < cfg->custom_count; i++) {
+      MangoCustomModule *cm = &cfg->customs[i];
+      if (!cm->enabled || cm->signal <= 0)
+        continue;
+      int signo = SIGRTMIN + cm->signal;
+      if (signo > SIGRTMAX) {
+        IPC_LOG("[signal] config[%zu] custom-%s: signal %d out of range (max %d)\n",
+                pi, cm->name, cm->signal, SIGRTMAX - SIGRTMIN);
+        continue;
+      }
+      if (custom_signal_count <
+          MANGOBAR_MAX_CONFIGS * MANGOBAR_MAX_CUSTOM) {
+        custom_signal_map[custom_signal_count].signo = signo;
+        custom_signal_map[custom_signal_count].pi = (int)pi;
+        custom_signal_map[custom_signal_count].ci = i;
+        custom_signal_count++;
+      }
+      struct sigaction sa;
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_handler = custom_signal_handler;
+      sigemptyset(&sa.sa_mask);
+      sa.sa_flags = SA_RESTART;
+      sigaction(signo, &sa, NULL);
+      IPC_LOG("[signal] config[%zu] custom-%s registered on SIGRTMIN+%d (%d)\n",
+              pi, cm->name, cm->signal, signo);
     }
-    if (custom_signal_count < MANGOBAR_MAX_CUSTOM) {
-      custom_signal_map[custom_signal_count].signo = signo;
-      custom_signal_map[custom_signal_count].ci = i;
-      custom_signal_count++;
-    }
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = custom_signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-    sigaction(signo, &sa, NULL);
-    IPC_LOG("[signal] custom-%s registered on SIGRTMIN+%d (%d)\n", cm->name,
-            cm->signal, signo);
   }
 }
 
@@ -4161,7 +4327,7 @@ static void event_loop() {
       if (ipc_fd >= 0)
         ipc_subscribe();
     }
-    if (sec - last_sec >= g_cfg.sys_interval) {
+    if (sec - last_sec >= g_config_set.profiles[0].config.sys_interval) {
       last_sec = sec;
       update_system_info();
       Bar *b;
@@ -4230,171 +4396,198 @@ static void apply_css(ModuleStyle *ms, const char *module, const char *state) {
   apply_css_resolved(ms, style_resolve(&g_style_sheet, module, state));
 }
 
-static void init_styles() {
-  ModuleStyle *all[] = {&st_tags[0], &st_tags[1], &st_tags[2],
-                        &st_tags[3], &st_tags[4], &st_layout,
-                        &st_title,   &st_clock,   &st_clock_date, &st_cpu,
-                        &st_mem,     &st_brightness, &st_volume,
-                        &st_keymode, &st_keyboardlayout, &st_network,
-                        &st_hide_clients, &st_battery, &st_overview,
-                        &st_separator, &st_tray, &st_bar, &st_bar_sel};
+static void init_profile_styles(ProfileRuntime *rt, MangoConfigProfile *profile) {
+  rt->profile = profile;
+  ModuleStyle *all[] = {&rt->st_tags[0], &rt->st_tags[1], &rt->st_tags[2],
+                        &rt->st_tags[3], &rt->st_tags[4], &rt->st_layout,
+                        &rt->st_title,   &rt->st_clock,   &rt->st_clock_date, &rt->st_cpu,
+                        &rt->st_mem,     &rt->st_brightness, &rt->st_volume,
+                        &rt->st_keymode, &rt->st_keyboardlayout, &rt->st_network,
+                        &rt->st_hide_clients, &rt->st_battery, &rt->st_overview,
+                        &rt->st_separator, &rt->st_tray, &rt->st_bar, &rt->st_bar_sel};
   for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
-    all[i]->radius = g_cfg.radius_default;
+    all[i]->radius = profile->config.radius_default;
   for (int i = 0; i < MANGOBAR_MAX_CUSTOM; i++) {
-    st_custom[i].radius = g_cfg.radius_default;
+    rt->st_custom[i].radius = profile->config.radius_default;
   }
   // Tags/layout default to pill shape; CSS border-radius overrides this.
   for (int i = 0; i < 5; i++)
-    st_tags[i].radius = -1;
-  st_layout.radius = -1;
+    rt->st_tags[i].radius = -1;
+  rt->st_layout.radius = -1;
   for (int i = 0; i < 5; i++)
-    st_tags[i].center = true;
-  st_layout.center = true;
-  st_overview.center = true;
+    rt->st_tags[i].center = true;
+  rt->st_layout.center = true;
+  rt->st_overview.center = true;
 
-  hex_to_pixman(active_fg_color_hex, &st_tags[0].fg);
-  hex_to_pixman(active_bg_color_hex, &st_tags[0].bg);
-  hex_to_pixman(occupied_fg_color_hex, &st_tags[1].fg);
-  hex_to_pixman(occupied_bg_color_hex, &st_tags[1].bg);
-  hex_to_pixman(urgent_fg_color_hex, &st_tags[2].fg);
-  hex_to_pixman(urgent_bg_color_hex, &st_tags[2].bg);
-  hex_to_pixman(empty_fg_color_hex, &st_tags[3].fg);
-  hex_to_pixman(empty_bg_color_hex, &st_tags[3].bg);
-  hex_to_pixman(inactive_fg_color_hex, &st_tags[4].fg);
-  hex_to_pixman(inactive_bg_color_hex, &st_tags[4].bg);
+  hex_to_pixman(active_fg_color_hex, &rt->st_tags[0].fg);
+  hex_to_pixman(active_bg_color_hex, &rt->st_tags[0].bg);
+  hex_to_pixman(occupied_fg_color_hex, &rt->st_tags[1].fg);
+  hex_to_pixman(occupied_bg_color_hex, &rt->st_tags[1].bg);
+  hex_to_pixman(urgent_fg_color_hex, &rt->st_tags[2].fg);
+  hex_to_pixman(urgent_bg_color_hex, &rt->st_tags[2].bg);
+  hex_to_pixman(empty_fg_color_hex, &rt->st_tags[3].fg);
+  hex_to_pixman(empty_bg_color_hex, &rt->st_tags[3].bg);
+  hex_to_pixman(inactive_fg_color_hex, &rt->st_tags[4].fg);
+  hex_to_pixman(inactive_bg_color_hex, &rt->st_tags[4].bg);
 
-  hex_to_pixman(layout_fg_color_hex, &st_layout.fg);
-  hex_to_pixman(layout_bg_color_hex, &st_layout.bg);
-  hex_to_pixman(title_fg_color_hex, &st_title.fg);
-  hex_to_pixman(title_bg_color_hex, &st_title.bg);
+  hex_to_pixman(layout_fg_color_hex, &rt->st_layout.fg);
+  hex_to_pixman(layout_bg_color_hex, &rt->st_layout.bg);
+  hex_to_pixman(title_fg_color_hex, &rt->st_title.fg);
+  hex_to_pixman(title_bg_color_hex, &rt->st_title.bg);
 
-  hex_to_pixman(cpu_fg_color_hex, &st_cpu.fg);
-  hex_to_pixman(cpu_bg_color_hex, &st_cpu.bg);
-  hex_to_pixman(mem_fg_color_hex, &st_mem.fg);
-  hex_to_pixman(mem_bg_color_hex, &st_mem.bg);
-  hex_to_pixman(brightness_fg_color_hex, &st_brightness.fg);
-  hex_to_pixman(brightness_bg_color_hex, &st_brightness.bg);
-  hex_to_pixman(volume_fg_color_hex, &st_volume.fg);
-  hex_to_pixman(volume_bg_color_hex, &st_volume.bg);
-  hex_to_pixman(clock_fg_color_hex, &st_clock.fg);
-  hex_to_pixman(clock_bg_color_hex, &st_clock.bg);
+  hex_to_pixman(cpu_fg_color_hex, &rt->st_cpu.fg);
+  hex_to_pixman(cpu_bg_color_hex, &rt->st_cpu.bg);
+  hex_to_pixman(mem_fg_color_hex, &rt->st_mem.fg);
+  hex_to_pixman(mem_bg_color_hex, &rt->st_mem.bg);
+  hex_to_pixman(brightness_fg_color_hex, &rt->st_brightness.fg);
+  hex_to_pixman(brightness_bg_color_hex, &rt->st_brightness.bg);
+  hex_to_pixman(volume_fg_color_hex, &rt->st_volume.fg);
+  hex_to_pixman(volume_bg_color_hex, &rt->st_volume.bg);
+  hex_to_pixman(clock_fg_color_hex, &rt->st_clock.fg);
+  hex_to_pixman(clock_bg_color_hex, &rt->st_clock.bg);
   for (int i = 0; i < MANGOBAR_MAX_CUSTOM; i++) {
-    st_custom[i].fg = st_clock.fg;
-    st_custom[i].bg = st_clock.bg;
+    rt->st_custom[i].fg = rt->st_clock.fg;
+    rt->st_custom[i].bg = rt->st_clock.bg;
   }
-  hex_to_pixman(clock_fg_color_hex, &st_clock_date.fg);
-  hex_to_pixman(clock_bg_color_hex, &st_clock_date.bg);
-  hex_to_pixman(keymode_fg_color_hex, &st_keymode.fg);
-  hex_to_pixman(keymode_bg_color_hex, &st_keymode.bg);
-  hex_to_pixman(keyboardlayout_fg_color_hex, &st_keyboardlayout.fg);
-  hex_to_pixman(keyboardlayout_bg_color_hex, &st_keyboardlayout.bg);
-  hex_to_pixman(clock_fg_color_hex, &st_network.fg);
-  hex_to_pixman(clock_bg_color_hex, &st_network.bg);
-  hex_to_pixman(hide_clients_fg_color_hex, &st_hide_clients.fg);
-  hex_to_pixman(hide_clients_bg_color_hex, &st_hide_clients.bg);
-  hex_to_pixman(battery_fg_color_hex, &st_battery.fg);
-  hex_to_pixman(battery_bg_color_hex, &st_battery.bg);
+  hex_to_pixman(clock_fg_color_hex, &rt->st_clock_date.fg);
+  hex_to_pixman(clock_bg_color_hex, &rt->st_clock_date.bg);
+  hex_to_pixman(keymode_fg_color_hex, &rt->st_keymode.fg);
+  hex_to_pixman(keymode_bg_color_hex, &rt->st_keymode.bg);
+  hex_to_pixman(keyboardlayout_fg_color_hex, &rt->st_keyboardlayout.fg);
+  hex_to_pixman(keyboardlayout_bg_color_hex, &rt->st_keyboardlayout.bg);
+  hex_to_pixman(clock_fg_color_hex, &rt->st_network.fg);
+  hex_to_pixman(clock_bg_color_hex, &rt->st_network.bg);
+  hex_to_pixman(hide_clients_fg_color_hex, &rt->st_hide_clients.fg);
+  hex_to_pixman(hide_clients_bg_color_hex, &rt->st_hide_clients.bg);
+  hex_to_pixman(battery_fg_color_hex, &rt->st_battery.fg);
+  hex_to_pixman(battery_bg_color_hex, &rt->st_battery.bg);
 
-  hex_to_pixman(tray_fg_color_hex, &st_tray.fg);
-  hex_to_pixman(tray_bg_color_hex, &st_tray.bg);
+  hex_to_pixman(tray_fg_color_hex, &rt->st_tray.fg);
+  hex_to_pixman(tray_bg_color_hex, &rt->st_tray.bg);
 
-  hex_to_pixman(overview_fg_color_hex, &st_overview.fg);
-  hex_to_pixman(overview_bg_color_hex, &st_overview.bg);
+  hex_to_pixman(overview_fg_color_hex, &rt->st_overview.fg);
+  hex_to_pixman(overview_bg_color_hex, &rt->st_overview.bg);
 
-  hex_to_pixman(separator_fg_color_hex, &st_separator.fg);
-  hex_to_pixman(separator_bg_color_hex, &st_separator.bg);
+  hex_to_pixman(separator_fg_color_hex, &rt->st_separator.fg);
+  hex_to_pixman(separator_bg_color_hex, &rt->st_separator.bg);
 
-  hex_to_pixman(middle_bg_color_hex, &st_bar.bg);
-  hex_to_pixman(middle_bg_color_hex, &st_bar.fg);
-  hex_to_pixman(middle_bg_sel_color_hex, &st_bar_sel.bg);
-  hex_to_pixman(middle_bg_sel_color_hex, &st_bar_sel.fg);
+  hex_to_pixman(middle_bg_color_hex, &rt->st_bar.bg);
+  hex_to_pixman(middle_bg_color_hex, &rt->st_bar.fg);
+  hex_to_pixman(middle_bg_sel_color_hex, &rt->st_bar_sel.bg);
+  hex_to_pixman(middle_bg_sel_color_hex, &rt->st_bar_sel.fg);
 
   if (!g_style_sheet.loaded)
     return;
 
-  apply_css(&st_tags[0], "tags", "active");
-  apply_css(&st_tags[1], "tags", "occupied");
-  apply_css(&st_tags[2], "tags", "urgent");
-  apply_css(&st_tags[3], "tags", "empty");
-  apply_css(&st_tags[4], "tags", "inactive");
+  apply_css(&rt->st_tags[0], "tags", "active");
+  apply_css(&rt->st_tags[1], "tags", "occupied");
+  apply_css(&rt->st_tags[2], "tags", "urgent");
+  apply_css(&rt->st_tags[3], "tags", "empty");
+  apply_css(&rt->st_tags[4], "tags", "inactive");
   // Waybar-style aliases (#workspaces, #workspaces button:hover): overlay only
   // the #workspaces rules so the "*" defaults don't clobber the #tags styles.
-  apply_css_resolved(&st_tags[0],
+  apply_css_resolved(&rt->st_tags[0],
                      style_resolve_module_only(&g_style_sheet, "workspaces",
                                                "active"));
-  apply_css_resolved(&st_tags[1],
+  apply_css_resolved(&rt->st_tags[1],
                      style_resolve_module_only(&g_style_sheet, "workspaces",
                                                "occupied"));
-  apply_css_resolved(&st_tags[2],
+  apply_css_resolved(&rt->st_tags[2],
                      style_resolve_module_only(&g_style_sheet, "workspaces",
                                                "urgent"));
-  apply_css_resolved(&st_tags[3],
+  apply_css_resolved(&rt->st_tags[3],
                      style_resolve_module_only(&g_style_sheet, "workspaces",
                                                "empty"));
-  apply_css_resolved(&st_tags[4],
+  apply_css_resolved(&rt->st_tags[4],
                      style_resolve_module_only(&g_style_sheet, "workspaces",
                                                "inactive"));
   Style hov_tags = style_resolve(&g_style_sheet, "tags", "hover");
   Style hov_ws =
       style_resolve_module_only(&g_style_sheet, "workspaces", "hover");
-  st_tag_hover_css = style_overlay(&hov_tags, &hov_ws);
-  apply_css(&st_layout, "layout", NULL);
-  apply_css(&st_title, "title", NULL);
-  apply_css(&st_clock, "clock", NULL);
-  apply_css(&st_clock_date, "clock", NULL);
-  apply_css(&st_clock_date, "clock", "date");
-  apply_css(&st_cpu, "cpu", NULL);
-  apply_css(&st_mem, "mem", NULL);
-  apply_css(&st_brightness, "brightness", NULL);
-  apply_css(&st_volume, "volume", NULL);
-  apply_css(&st_keymode, "keymode", NULL);
-  apply_css(&st_keyboardlayout, "keyboardlayout", NULL);
-  apply_css(&st_network, "network", NULL);
-  apply_css(&st_hide_clients, "hideclients", NULL);
-  apply_css(&st_battery, "battery", NULL);
-  apply_css(&st_overview, "overview", NULL);
-  apply_css(&st_separator, "separator", NULL);
-  apply_css(&st_tray, "tray", NULL);
-  apply_css(&st_bar, "bar", NULL);
-  apply_css(&st_bar_sel, "bar", "sel");
-  for (int i = 0; i < g_cfg.custom_count; i++) {
-    if (!g_cfg.customs[i].enabled)
+  rt->st_tag_hover_css = style_overlay(&hov_tags, &hov_ws);
+  apply_css(&rt->st_layout, "layout", NULL);
+  apply_css(&rt->st_title, "title", NULL);
+  apply_css(&rt->st_clock, "clock", NULL);
+  apply_css(&rt->st_clock_date, "clock", NULL);
+  apply_css(&rt->st_clock_date, "clock", "date");
+  apply_css(&rt->st_cpu, "cpu", NULL);
+  apply_css(&rt->st_mem, "mem", NULL);
+  apply_css(&rt->st_brightness, "brightness", NULL);
+  apply_css(&rt->st_volume, "volume", NULL);
+  apply_css(&rt->st_keymode, "keymode", NULL);
+  apply_css(&rt->st_keyboardlayout, "keyboardlayout", NULL);
+  apply_css(&rt->st_network, "network", NULL);
+  apply_css(&rt->st_hide_clients, "hideclients", NULL);
+  apply_css(&rt->st_battery, "battery", NULL);
+  apply_css(&rt->st_overview, "overview", NULL);
+  apply_css(&rt->st_separator, "separator", NULL);
+  apply_css(&rt->st_tray, "tray", NULL);
+  apply_css(&rt->st_bar, "bar", NULL);
+  apply_css(&rt->st_bar_sel, "bar", "sel");
+  for (int i = 0; i < profile->config.custom_count; i++) {
+    if (!profile->config.customs[i].enabled)
       continue;
     char sel[96];
-    snprintf(sel, sizeof(sel), "custom-%s", g_cfg.customs[i].name);
-    apply_css(&st_custom[i], sel, NULL);
+    snprintf(sel, sizeof(sel), "custom-%s", profile->config.customs[i].name);
+    apply_css(&rt->st_custom[i], sel, NULL);
   }
 
   // Top margin comes from the #bar CSS margin.
   Style bar_s = style_resolve(&g_style_sheet, "bar", "");
-  bar_top = bar_s.margin_top_set ? bar_s.margin_top : 0;
-  bar_left = bar_s.margin_left_set ? (uint32_t)bar_s.margin_left : 0;
-  bar_right = bar_s.margin_right_set ? (uint32_t)bar_s.margin_right : 0;
-  bar_h = (uint32_t)g_cfg.bar_height;
+  rt->bar_top = bar_s.margin_top_set ? bar_s.margin_top : 0;
+  rt->bar_left = bar_s.margin_left_set ? (uint32_t)bar_s.margin_left : 0;
+  rt->bar_right = bar_s.margin_right_set ? (uint32_t)bar_s.margin_right : 0;
+  rt->bar_h = (uint32_t)profile->config.bar_height;
 }
 
 int main() {
   // Honor the user's locale for strftime (e.g. Chinese month/day names).
   setlocale(LC_TIME, "");
 
-  // Load external JSONC config.
-  mango_config_defaults();
+  // Load external JSONC config (single object, root array of profiles, or
+  // comma-separated object sequence).
+  char err[512];
   char cfg_buf[512];
   const char *cfg_file = mango_config_find_default(cfg_buf, sizeof(cfg_buf));
   if (cfg_file) {
-    if (mango_config_load(cfg_file) == 0)
-      fprintf(stderr, "Loaded config: %s\n", cfg_file);
+    if (mango_config_set_load(&g_config_set, cfg_file, err, sizeof(err)) != 0) {
+      fprintf(stderr, "mangobar: config error: %s\n", err);
+      return 1;
+    }
+    fprintf(stderr, "Loaded config: %s\n", cfg_file);
   } else {
-    mango_config_parse(default_config_jsonc);
+    if (mango_config_set_parse(&g_config_set, default_config_jsonc, err,
+                               sizeof(err)) != 0) {
+      fprintf(stderr, "mangobar: config error: %s\n", err);
+      return 1;
+    }
     fprintf(stderr, "Using built-in default config\n");
   }
 
-  // Load CSS style sheet
+  // Defensive check for an empty configuration set.
+  if (g_config_set.count == 0) {
+    fprintf(stderr, "mangobar: empty configuration, exiting\n");
+    return 0;
+  }
+
+  // Global baseline config for shared system sampling (CPU/mem/volume/clock).
+  g_cfg_ptr = &g_config_set.profiles[0].config;
+
+  // One profile runtime per config profile.
+  g_runtimes = calloc(g_config_set.count, sizeof(ProfileRuntime));
+  if (!g_runtimes) {
+    fprintf(stderr, "mangobar: out of memory allocating profiles\n");
+    return 1;
+  }
+
+  // Load the shared CSS style sheet. A single root object keeps its inline
+  // css/style path; profile sequences use shared/default CSS.
   style_sheet_init(&g_style_sheet);
   char css_buf[512];
   const char *css_file = NULL;
-  if (g_cfg.css_path[0]) {
-    css_file = g_cfg.css_path;
+  MangoConfig *base = &g_config_set.profiles[0].config;
+  if (base->css_path[0]) {
+    css_file = base->css_path;
   } else if (style_find_default_path(css_buf, sizeof(css_buf)) == 0) {
     css_file = css_buf;
   }
@@ -4405,13 +4598,14 @@ int main() {
     fprintf(stderr, "Using built-in default CSS\n");
   }
 
+  // The font is shared across outputs; fall back to the first profile's font.
   fcft_init(FCFT_LOG_COLORIZE_AUTO, 0, FCFT_LOG_CLASS_ERROR);
   snprintf(g_font_base, sizeof(g_font_base), "%s",
-           style_font_string(&g_style_sheet, g_cfg.font));
+           style_font_string(&g_style_sheet, base->font));
   font = fcft_from_name(1, (const char *[]){g_font_base}, NULL);
   if (!font) {
     // Fall back to the config font if the CSS font fails
-    snprintf(g_font_base, sizeof(g_font_base), "%s", g_cfg.font);
+    snprintf(g_font_base, sizeof(g_font_base), "%s", base->font);
     font = fcft_from_name(1, (const char *[]){g_font_base}, NULL);
   }
   if (!font) {
@@ -4419,19 +4613,22 @@ int main() {
     return 1;
   }
 
-  init_styles();
-  // Ensure the bar is tall enough for the text (no vertical clipping)
+  // Resolve styles and geometry for every profile.
   int min_h = font->ascent + font->descent + 4;
-  if ((int)bar_h < min_h)
-    bar_h = (uint32_t)min_h;
-  // Keep tag/layout buttons at least as wide as the bar is tall (so the pill
-  // default reads as a circle). CSS border-radius still controls the shape.
-  for (int i = 0; i < 5; i++) {
-    st_tags[i].min_width =
-        (int)bar_h + st_tags[i].margin_l + st_tags[i].margin_r;
+  for (size_t i = 0; i < g_config_set.count; i++) {
+    ProfileRuntime *rt = &g_runtimes[i];
+    init_profile_styles(rt, &g_config_set.profiles[i]);
+    // Ensure the bar is tall enough for the text (no vertical clipping).
+    if ((int)rt->bar_h < min_h)
+      rt->bar_h = (uint32_t)min_h;
+    // Keep tag/layout buttons at least as wide as the bar is tall.
+    for (int j = 0; j < 5; j++)
+      rt->st_tags[j].min_width =
+          (int)rt->bar_h + rt->st_tags[j].margin_l + rt->st_tags[j].margin_r;
+    rt->st_layout.min_width =
+        (int)rt->bar_h + rt->st_layout.margin_l + rt->st_layout.margin_r;
   }
-  st_layout.min_width =
-      (int)bar_h + st_layout.margin_l + st_layout.margin_r;
+
   display = wl_display_connect(NULL);
   if (!display)
     return 1;
@@ -4490,5 +4687,7 @@ int main() {
   fcft_destroy(font);
   fcft_fini();
   wl_display_disconnect(display);
+  mango_config_set_destroy(&g_config_set);
+  free(g_runtimes);
   return 0;
 }
