@@ -34,7 +34,6 @@
             ];
 
             buildInputs = with pkgs; [
-              alsa-lib
               cairo
               cjson
               fcft

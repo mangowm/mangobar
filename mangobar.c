@@ -1,5 +1,4 @@
 #define _GNU_SOURCE
-#include <alsa/asoundlib.h>
 #include <cairo/cairo.h>
 #include <cjson/cJSON.h>
 #include <math.h>
@@ -3829,44 +3828,9 @@ static void pulse_init(void) {
 static void update_volume() {
   int pct = atomic_load(&pa_pct);
   int muted = atomic_load(&pa_muted);
-  // ALSA fallback while PulseAudio isn't ready
-  if (pct < 0) {
-    snd_mixer_t *handle = NULL;
-    if (snd_mixer_open(&handle, 0) == 0) {
-      if (snd_mixer_attach(handle, "default") == 0) {
-        snd_mixer_selem_register(handle, NULL, NULL);
-        snd_mixer_load(handle);
-        snd_mixer_selem_id_t *sid = NULL;
-        snd_mixer_selem_id_malloc(&sid);
-        if (sid) {
-          snd_mixer_selem_id_set_index(sid, g_config_set.profiles[0].config.volume_mix_index);
-          snd_mixer_selem_id_set_name(sid, g_config_set.profiles[0].config.volume_ctrl);
-          snd_mixer_elem_t *elem = snd_mixer_find_selem(handle, sid);
-          long minv = 0, maxv = 0;
-          if (elem && snd_mixer_selem_get_playback_volume_range(elem, &minv,
-                                                                &maxv) == 0 &&
-              maxv > minv) {
-            long vol = 0;
-            snd_mixer_selem_get_playback_volume(elem, SND_MIXER_SCHN_FRONT_LEFT,
-                                                &vol);
-            pct = (int)(100 * (vol - minv) / (maxv - minv));
-            if (pct < 0)
-              pct = 0;
-            if (pct > 100)
-              pct = 100;
-            int on = 0;
-            if (snd_mixer_selem_get_playback_switch(
-                    elem, SND_MIXER_SCHN_FRONT_LEFT, &on) == 0)
-              muted = on ? 0 : 1;
-          }
-          snd_mixer_selem_id_free(sid);
-        }
-      }
-      snd_mixer_close(handle);
-    }
-  }
   Bar *bar;
   wl_list_for_each(bar, &bar_list, link) {
+    // PulseAudio not ready yet: keep 0% until the first sink event arrives.
     bar->volume_pct = pct >= 0 ? pct : 0;
     bar->volume_muted = muted == 1;
     bar->volume_bt = atomic_load(&pa_sink_bt) || atomic_load(&pa_source_bt);

@@ -731,9 +731,6 @@ static void defaults_into(MangoConfig *cfg) {
            "");
   snprintf(cfg->brightness_fmt, sizeof(cfg->brightness_fmt), "%s",
            "☀{}%");
-  snprintf(cfg->volume_ctrl, sizeof(cfg->volume_ctrl), "%s",
-           "Master");
-  cfg->volume_mix_index = 0;
   snprintf(cfg->volume_fmt, sizeof(cfg->volume_fmt), "%s",
            "♪{}%");
   snprintf(cfg->volume_fmt_muted, sizeof(cfg->volume_fmt_muted), "%s",
