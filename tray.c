@@ -78,6 +78,7 @@ struct MangobarTray {
   void (*set_dirty)(void);
   char **basedirs;
   int basedir_count;
+  char *icon_theme; // GTK icon theme name
   sd_bus_slot *name_slot; // NameOwnerChanged subscription for cleanup
   bool dead;
 };
@@ -102,6 +103,94 @@ static int find_index(char **arr, int n, const char *id) {
     if (arr[i] && strcmp(arr[i], id) == 0)
       return i;
   return -1;
+}
+
+// ---------- GTK icon theme ----------
+// Read gtk-icon-theme-name from a GTK settings.ini file.
+static bool read_settings_ini_value(const char *path, char *out,
+                                    size_t outsz) {
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return false;
+  bool found = false;
+  char line[1024];
+  while (fgets(line, sizeof(line), f)) {
+    char *p = line;
+    while (*p == ' ' || *p == '\t')
+      p++;
+    if (*p == '\0' || *p == '#' || *p == ';' || *p == '\n')
+      continue; // empty line or comment
+    char *eq = strchr(p, '=');
+    if (!eq)
+      continue;
+    char *key_end = eq;
+    while (key_end > p && (key_end[-1] == ' ' || key_end[-1] == '\t'))
+      key_end--;
+    static const char key[] = "gtk-icon-theme-name";
+    if ((size_t)(key_end - p) != sizeof(key) - 1 ||
+        memcmp(p, key, sizeof(key) - 1) != 0)
+      continue;
+    char *v = eq + 1;
+    while (*v == ' ' || *v == '\t')
+      v++;
+    char *end = v + strlen(v);
+    while (end > v && (end[-1] == '\n' || end[-1] == '\r' ||
+                       end[-1] == ' ' || end[-1] == '\t'))
+      end--;
+    *end = '\0';
+    // Strip optional surrounding quotes
+    if (*v == '"' || *v == '\'') {
+      char quote = *v;
+      size_t l = strlen(v);
+      if (l >= 2 && v[l - 1] == quote) {
+        v++;
+        v[l - 2] = '\0';
+      }
+    }
+    size_t len = strlen(v);
+    if (len > 0) {
+      if (len >= outsz)
+        len = outsz - 1;
+      memcpy(out, v, len);
+      out[len] = '\0';
+      found = true;
+      break;
+    }
+  }
+  fclose(f);
+  return found;
+}
+
+// Try $XDG_CONFIG_HOME/gtk-X.0/settings.ini, then /etc/gtk-X.0,
+// with GTK3 before GTK4.
+static char *gtk_icon_theme_name(void) {
+  char cfgdir[1600];
+  const char *xdg = getenv("XDG_CONFIG_HOME");
+  if (xdg && *xdg && xdg[0] == '/') {
+    snprintf(cfgdir, sizeof(cfgdir), "%s", xdg);
+  } else {
+    const char *home = getenv("HOME");
+    if (!home || !*home)
+      return NULL;
+    snprintf(cfgdir, sizeof(cfgdir), "%s/.config", home);
+  }
+  char value[256];
+  static const char *versions[] = {"3.0", "4.0"};
+  for (size_t i = 0; i < sizeof(versions) / sizeof(versions[0]); i++) {
+    char path[1800];
+    snprintf(path, sizeof(path), "%s/gtk-%s/settings.ini", cfgdir,
+             versions[i]);
+    if (read_settings_ini_value(path, value, sizeof(value)))
+      return strdup(value);
+    snprintf(path, sizeof(path), "/etc/gtk-%s/settings.ini", versions[i]);
+    if (read_settings_ini_value(path, value, sizeof(value)))
+      return strdup(value);
+  }
+  return NULL;
+}
+
+static void init_icon_theme(MangobarTray *tray) {
+  tray->icon_theme = gtk_icon_theme_name();
 }
 
 // ---------- Icon conversion ----------
@@ -318,6 +407,44 @@ static void find_icon_in_dir(const char *base, const char *name, int target,
   closedir(d);
 }
 
+// Whether this top-level theme dir was already searched by an earlier,
+// higher-priority stage.
+static bool theme_already_searched(const char *dir_name, const char *theme) {
+  if (strcmp(dir_name, "hicolor") == 0 || strcmp(dir_name, "Adwaita") == 0)
+    return true;
+  return theme && strcmp(dir_name, theme) == 0;
+}
+
+// Search the icon theme directory with the given name under every basedir.
+static void scan_named_theme(MangobarTray *tray, const char *dir_name,
+                             const char *name, int target,
+                             IconCandidate *cands, int *count, int *budget,
+                             int pri, const char variants[][128],
+                             int nvariants) {
+  for (int i = 0; i < tray->basedir_count && *count < MAX_ICON_CANDIDATES &&
+                     *budget > 0;
+       i++) {
+    DIR *rd = opendir(tray->basedirs[i]);
+    if (!rd)
+      continue;
+    struct dirent *e;
+    while ((e = readdir(rd)) && *count < MAX_ICON_CANDIDATES && *budget > 0) {
+      (*budget)--;
+      if (e->d_name[0] == '.' || strcmp(e->d_name, dir_name) != 0)
+        continue;
+      char p[1600];
+      snprintf(p, sizeof(p), "%.*s/%s", (int)(sizeof(p) - 300),
+               tray->basedirs[i], e->d_name);
+      struct stat st;
+      if (stat(p, &st) == 0 && S_ISDIR(st.st_mode))
+        find_icon_in_dir(p, name, target, 0, cands, count, budget, pri,
+                         variants, nvariants);
+      break; // a theme directory appears at most once per basedir
+    }
+    closedir(rd);
+  }
+}
+
 static char *find_icon(MangobarTray *tray, const char *name,
                        const char *extra, int target) {
   if (!name || !*name)
@@ -347,68 +474,78 @@ static char *find_icon(MangobarTray *tray, const char *name,
   IconCandidate cands[MAX_ICON_CANDIDATES];
   int count = 0;
   int budget = MAX_ICON_LOOKUP_ENTRIES;
-  const char *theme = getenv("XCURSOR_THEME");
-  for (int i = 0; i < tray->basedir_count && count < MAX_ICON_CANDIDATES; i++) {
-    DIR *rd = opendir(tray->basedirs[i]);
-    if (!rd) {
-      find_icon_in_dir(tray->basedirs[i], name, target, 0, cands, &count,
-                       &budget, 10000, variants, nvariants);
-      continue;
-    }
-    struct dirent *e;
-    while ((e = readdir(rd)) && count < MAX_ICON_CANDIDATES && budget > 0) {
-      budget--;
-      if (e->d_name[0] == '.')
-        continue;
-      char p[1600];
-      snprintf(p, sizeof(p), "%.*s/%s", (int)(sizeof(p) - 300),
-               tray->basedirs[i], e->d_name);
-      struct stat st;
-      if (stat(p, &st) != 0)
-        continue;
-      if (S_ISDIR(st.st_mode)) {
-        int pri = 10000;
-        if (theme && strcmp(e->d_name, theme) == 0)
-          pri = 40000;
-        else if (strcmp(e->d_name, "hicolor") == 0)
-          pri = 30000;
-        else if (strcmp(e->d_name, "Adwaita") == 0)
-          pri = 20000;
-        find_icon_in_dir(p, name, target, 0, cands, &count, &budget, pri,
-                         variants, nvariants);
-      } else {
-        // Loose files at the basedir root (e.g. /usr/share/pixmaps)
-        size_t dl = strlen(e->d_name);
-        bool is_png = dl >= 4 && strcmp(e->d_name + dl - 4, ".png") == 0;
-        bool is_svg = dl >= 4 && strcmp(e->d_name + dl - 4, ".svg") == 0;
-        if (!is_png && !is_svg)
-          continue;
-        if (dl < 5)
-          continue;
-        char stem[128];
-        size_t sl = dl - 4;
-        if (sl >= sizeof(stem))
-          continue;
-        memcpy(stem, e->d_name, sl);
-        stem[sl] = '\0';
-        bool match = false;
-        for (int v = 0; v < nvariants; v++)
-          if (strcmp(stem, variants[v]) == 0) {
-            match = true;
-            break;
-          }
-        if (match && count < MAX_ICON_CANDIDATES) {
-          IconCandidate *c = &cands[count++];
-          snprintf(c->path, sizeof(c->path), "%s", p);
-          c->score = 10000;
-        }
-      }
-    }
-    closedir(rd);
-  }
+  const char *theme = tray->icon_theme;
+  // App-provided IconThemePath overrides the configured theme.
   if (extra && *extra && count < MAX_ICON_CANDIDATES)
     find_icon_in_dir(extra, name, target, 0, cands, &count, &budget, 50000,
                      variants, nvariants);
+  // Search preferred themes first, and only continue when none has the icon.
+  if (count == 0 && theme && *theme)
+    scan_named_theme(tray, theme, name, target, cands, &count, &budget, 40000,
+                     variants, nvariants);
+  if (count == 0 && (!theme || strcmp(theme, "hicolor") != 0))
+    scan_named_theme(tray, "hicolor", name, target, cands, &count, &budget,
+                     30000, variants, nvariants);
+  if (count == 0 && (!theme || strcmp(theme, "Adwaita") != 0))
+    scan_named_theme(tray, "Adwaita", name, target, cands, &count, &budget,
+                     20000, variants, nvariants);
+  if (count == 0) {
+    // Search remaining themes and loose icon files.
+    for (int i = 0; i < tray->basedir_count && count < MAX_ICON_CANDIDATES;
+         i++) {
+      DIR *rd = opendir(tray->basedirs[i]);
+      if (!rd) {
+        find_icon_in_dir(tray->basedirs[i], name, target, 0, cands, &count,
+                         &budget, 10000, variants, nvariants);
+        continue;
+      }
+      struct dirent *e;
+      while ((e = readdir(rd)) && count < MAX_ICON_CANDIDATES && budget > 0) {
+        budget--;
+        if (e->d_name[0] == '.')
+          continue;
+        char p[1600];
+        snprintf(p, sizeof(p), "%.*s/%s", (int)(sizeof(p) - 300),
+                 tray->basedirs[i], e->d_name);
+        struct stat st;
+        if (stat(p, &st) != 0)
+          continue;
+        if (S_ISDIR(st.st_mode)) {
+          if (theme_already_searched(e->d_name, theme))
+            continue;
+          find_icon_in_dir(p, name, target, 0, cands, &count, &budget, 10000,
+                           variants, nvariants);
+        } else {
+          // Loose files at the basedir root (e.g. /usr/share/pixmaps)
+          size_t dl = strlen(e->d_name);
+          bool is_png = dl >= 4 && strcmp(e->d_name + dl - 4, ".png") == 0;
+          bool is_svg = dl >= 4 && strcmp(e->d_name + dl - 4, ".svg") == 0;
+          if (!is_png && !is_svg)
+            continue;
+          if (dl < 5)
+            continue;
+          char stem[128];
+          size_t sl = dl - 4;
+          if (sl >= sizeof(stem))
+            continue;
+          memcpy(stem, e->d_name, sl);
+          stem[sl] = '\0';
+          bool match = false;
+          for (int v = 0; v < nvariants; v++)
+            if (strcmp(stem, variants[v]) == 0) {
+              match = true;
+              break;
+            }
+          if (match && count < MAX_ICON_CANDIDATES) {
+            IconCandidate *c = &cands[count++];
+            snprintf(c->path, sizeof(c->path), "%s", p);
+            c->score = 10000;
+          }
+        }
+      }
+      closedir(rd);
+    }
+  }
   if (count == 0) {
     // Cache misses too
     if (icon_cache_count < ICON_CACHE_MAX) {
@@ -1057,6 +1194,7 @@ MangobarTray *tray_init(void (*set_dirty)(void)) {
   tray->fd = sd_bus_get_fd(bus);
   tray->set_dirty = set_dirty;
   init_basedirs(tray);
+  init_icon_theme(tray);
   tray->watcher_xdg = create_watcher(tray, "freedesktop");
   tray->watcher_kde = create_watcher(tray, "kde");
   init_host(tray, "freedesktop", &tray->host_xdg);
@@ -1132,6 +1270,7 @@ void tray_destroy(MangobarTray *tray) {
   for (int i = 0; i < tray->basedir_count; i++)
     free(tray->basedirs[i]);
   free(tray->basedirs);
+  free(tray->icon_theme);
   sd_bus_flush_close_unref(tray->bus);
   free(tray);
 }
