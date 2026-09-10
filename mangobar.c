@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcft/fcft.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <locale.h>
 #include <linux/input-event-codes.h>
 #include <libudev.h>
@@ -43,6 +44,22 @@
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 #include "xdg-output-unstable-v1-protocol.h"
 #include "xdg-shell-protocol.h"
+
+#ifndef MANGOBAR_VERSION
+#define MANGOBAR_VERSION "unknown"
+#endif
+
+static void print_usage(const char *prog) {
+  printf("Usage: %s [options]\n", prog);
+  printf("\n");
+  printf("A Wayland status bar for mangowm.\n");
+  printf("\n");
+  printf("Options:\n");
+  printf("  -h            Show this help message and exit.\n");
+  printf("  -v            Show version information and exit.\n");
+  printf("  -c <path>     Use the given configuration file (JSONC).\n");
+  printf("  -s <path>     Use the given CSS style file.\n");
+}
 
 // Default colors (overridable by style.css)
 static const uint32_t active_fg_color_hex = 0x000000FF;
@@ -4504,15 +4521,48 @@ static void init_profile_styles(ProfileRuntime *rt, MangoConfigProfile *profile)
   rt->bar_h = (uint32_t)profile->config.bar_height;
 }
 
-int main() {
+int main(int argc, char **argv) {
   // Honor the user's locale for strftime (e.g. Chinese month/day names).
   setlocale(LC_TIME, "");
+
+  // Command-line overrides.
+  const char *opt_config = NULL;
+  const char *opt_css = NULL;
+  int opt;
+  while ((opt = getopt(argc, argv, "hvc:s:")) != -1) {
+    switch (opt) {
+      case 'h':
+        print_usage(argv[0]);
+        return 0;
+      case 'v':
+        printf("mangobar %s\n", MANGOBAR_VERSION);
+        return 0;
+      case 'c':
+        opt_config = optarg;
+        break;
+      case 's':
+        opt_css = optarg;
+        break;
+      default:
+        print_usage(argv[0]);
+        return 1;
+    }
+  }
 
   // Load external JSONC config (a single object or a root array of
   // profiles).
   char err[512];
   char cfg_buf[512];
-  const char *cfg_file = mango_config_find_default(cfg_buf, sizeof(cfg_buf));
+  const char *cfg_file;
+  if (opt_config) {
+    if (access(opt_config, R_OK) != 0) {
+      fprintf(stderr, "mangobar: cannot read config file: %s\n", opt_config);
+      return 1;
+    }
+    cfg_file = opt_config;
+  } else {
+    cfg_file = mango_config_find_default(cfg_buf, sizeof(cfg_buf));
+  }
   if (cfg_file) {
     if (mango_config_set_load(&g_config_set, cfg_file, err, sizeof(err)) != 0) {
       fprintf(stderr, "mangobar: config error: %s\n", err);
@@ -4550,7 +4600,13 @@ int main() {
   char css_buf[512];
   const char *css_file = NULL;
   MangoConfig *base = &g_config_set.profiles[0].config;
-  if (base->css_path[0]) {
+  if (opt_css) {
+    if (access(opt_css, R_OK) != 0) {
+      fprintf(stderr, "mangobar: cannot read css file: %s\n", opt_css);
+      return 1;
+    }
+    css_file = opt_css;
+  } else if (base->css_path[0]) {
     css_file = base->css_path;
   } else if (style_find_default_path(css_buf, sizeof(css_buf)) == 0) {
     css_file = css_buf;
