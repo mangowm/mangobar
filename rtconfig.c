@@ -710,6 +710,7 @@ static void parse_module_configs(cJSON *root) {
 static void defaults_into(MangoConfig *cfg) {
   memset(cfg, 0, sizeof(*cfg));
   cfg->bar_height = 30;
+  cfg->bar_anchor = MANGO_ANCHOR_TOP;
   cfg->buffer_scale = 1;
   snprintf(cfg->font, sizeof(cfg->font), "%s",
            "Maple Mono NF CN:style=Bold:size=24");
@@ -850,6 +851,17 @@ static int parse_object_into(cJSON *root, MangoConfig *cfg) {
                                              "smooth-scrolling-threshold")) &&
       cJSON_IsNumber(v) && v->valuedouble > 0.0)
     cfg->smooth_scroll_threshold = v->valuedouble;
+
+  if ((v = cJSON_GetObjectItemCaseSensitive(root, "anchor")) && 
+      cJSON_IsString(v)) {
+    if (strcmp(v->valuestring, "bottom") == 0) {
+      cfg->bar_anchor = MANGO_ANCHOR_BOTTOM;
+    } else {
+      // top as the default 
+      cfg->bar_anchor = MANGO_ANCHOR_TOP;
+    }
+  }
+
   if ((v = cJSON_GetObjectItemCaseSensitive(root, "layer")) &&
       cJSON_IsString(v)) {
     if (strcmp(v->valuestring, "overlay") == 0)
