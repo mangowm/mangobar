@@ -2,20 +2,20 @@
 #include "style.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #define MANGOBAR_MAX_IMPORT_DEPTH 8
-#define MANGOBAR_PATH_MAX 1024
 
 static void apply_rule(Style *dst, const StyleRule *r);
 static int style_parse_internal(StyleSheet *ss, const char *buf,
-                                const char *base_dir,
-                                char (*stack)[MANGOBAR_PATH_MAX], int depth);
+                                const char *base_dir, char (*stack)[PATH_MAX],
+                                int depth);
 static int style_load_recursive(StyleSheet *ss, const char *path,
-                               char (*stack)[MANGOBAR_PATH_MAX], int depth);
+                                char (*stack)[PATH_MAX], int depth);
 
 static char *read_file(const char *path) {
   FILE *f = fopen(path, "r");
@@ -112,8 +112,8 @@ static int config_dir(char *out, size_t outsz) {
   return -1;
 }
 
-static int try_load(StyleSheet *ss, const char *full,
-                    char (*stack)[MANGOBAR_PATH_MAX], int depth) {
+static int try_load(StyleSheet *ss, const char *full, char (*stack)[PATH_MAX],
+                    int depth) {
   if (access(full, R_OK) != 0)
     return -1;
   return style_load_recursive(ss, full, stack, depth + 1) == 0 ? 0 : -1;
@@ -131,15 +131,15 @@ static int join_path(char *out, size_t outsz, const char *dir,
 }
 
 static void import_css(StyleSheet *ss, const char *base_dir, const char *url,
-                       char (*stack)[MANGOBAR_PATH_MAX], int depth) {
-  char full[MANGOBAR_PATH_MAX];
+                       char (*stack)[PATH_MAX], int depth) {
+  char full[PATH_MAX];
   if (url[0] == '~' || url[0] == '/') {
     expand_tilde(url, full, sizeof(full));
     if (try_load(ss, full, stack, depth) != 0)
       fprintf(stderr, "mangobar: failed to import css: %s\n", full);
     return;
   }
-  char cfg[MANGOBAR_PATH_MAX];
+  char cfg[PATH_MAX];
   int have_cfg = config_dir(cfg, sizeof(cfg)) == 0;
   const char *dirs[3] = {base_dir, have_cfg ? cfg : NULL, "."};
   for (int i = 0; i < 3; i++) {
@@ -679,8 +679,8 @@ static void parse_selector(const char *sel, char *module, size_t msz,
 }
 
 static int style_parse_internal(StyleSheet *ss, const char *buf,
-                                const char *base_dir,
-                                char (*stack)[MANGOBAR_PATH_MAX], int depth) {
+                                const char *base_dir, char (*stack)[PATH_MAX],
+                                int depth) {
   const char *p = buf;
   for (;;) {
     skip_ws_comments(&p);
@@ -690,7 +690,7 @@ static int style_parse_internal(StyleSheet *ss, const char *buf,
     if (strncmp(p, "@import", 7) == 0 &&
         !(isalnum((unsigned char)p[7]) || p[7] == '-' || p[7] == '_')) {
       p += 7;
-      char url[MANGOBAR_PATH_MAX];
+      char url[PATH_MAX];
       if (parse_import_url(&p, url, sizeof(url)) && url[0]) {
         while (*p && *p != ';')
           p++;
@@ -838,14 +838,14 @@ static int style_parse_internal(StyleSheet *ss, const char *buf,
 }
 
 static int style_load_recursive(StyleSheet *ss, const char *path,
-                                char (*stack)[MANGOBAR_PATH_MAX], int depth) {
+                                char (*stack)[PATH_MAX], int depth) {
   if (depth >= MANGOBAR_MAX_IMPORT_DEPTH) {
     fprintf(stderr, "mangobar: css @import nested too deeply: %s\n", path);
     return -1;
   }
-  char real[MANGOBAR_PATH_MAX];
+  char real[PATH_MAX];
   expand_tilde(path, real, sizeof(real));
-  char canon[MANGOBAR_PATH_MAX];
+  char canon[PATH_MAX];
   if (!realpath(real, canon))
     snprintf(canon, sizeof(canon), "%s", real);
   for (int i = 0; i < depth; i++) {
@@ -854,14 +854,14 @@ static int style_load_recursive(StyleSheet *ss, const char *path,
       return -1;
     }
   }
-  snprintf(stack[depth], MANGOBAR_PATH_MAX, "%s", canon);
+  snprintf(stack[depth], PATH_MAX, "%s", canon);
 
   char *buf = read_file(real);
   if (!buf) {
     fprintf(stderr, "mangobar: cannot read css file: %s\n", real);
     return -1;
   }
-  char base_dir[MANGOBAR_PATH_MAX];
+  char base_dir[PATH_MAX];
   snprintf(base_dir, sizeof(base_dir), "%s", real);
   char *slash = strrchr(base_dir, '/');
   if (slash)
@@ -875,12 +875,12 @@ static int style_load_recursive(StyleSheet *ss, const char *path,
 }
 
 int style_sheet_parse(StyleSheet *ss, const char *buf) {
-  char stack[MANGOBAR_MAX_IMPORT_DEPTH][MANGOBAR_PATH_MAX];
+  char stack[MANGOBAR_MAX_IMPORT_DEPTH][PATH_MAX];
   return style_parse_internal(ss, buf, NULL, stack, 0);
 }
 
 int style_sheet_load(StyleSheet *ss, const char *path) {
-  char stack[MANGOBAR_MAX_IMPORT_DEPTH][MANGOBAR_PATH_MAX];
+  char stack[MANGOBAR_MAX_IMPORT_DEPTH][PATH_MAX];
   return style_load_recursive(ss, path, stack, 0);
 }
 
