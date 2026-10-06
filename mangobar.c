@@ -10,7 +10,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <locale.h>
-#include <linux/input-event-codes.h>
+#include "input-event-codes.h"
 #include <linux/wireless.h>
 #include <libudev.h>
 #include <pixman.h>
