@@ -1,7 +1,9 @@
 #define _GNU_SOURCE
 #include <cairo/cairo.h>
 #include <cjson/cJSON.h>
+#include <arpa/inet.h>
 #include <math.h>
+#include <net/if.h>
 #include <pango/pango.h>
 #include <pango/pangocairo.h>
 #include <dirent.h>
@@ -351,21 +353,23 @@ static void format_speed(double kbps, char *out, size_t outsz) {
     snprintf(out, outsz, "%.0fKB/s", kbps);
 }
 
-// Expand a network format. {ifname}/{} carry the interface name, {ssid} the
-// wireless SSID, {signal} the strength icon and {strength} the strength
-// percent, {status} is "connected"/"disconnected", {type} is "wifi"/"ethernet"
-// (empty otherwise), {icon} is the interface icon and {down}/{up} are the
-// speed-mode values.
+// Expand a network format. {ifname}/{} carry the interface name, {ipaddr}/{ip}
+// the interface's IPv4 address, {ssid} the wireless SSID, {signal} the strength
+// icon and {strength} the strength percent, {status} is
+// "connected"/"disconnected", {type} is "wifi"/"ethernet" (empty otherwise),
+// {icon} is the interface icon and {down}/{up} are the speed-mode values.
 static void format_network(const char *fmt, const char *ifname,
-                           const char *ssid, const char *signal,
-                           const char *strength, const char *down,
-                           const char *up, const char *status, const char *type,
-                           const char *icon, char *out, size_t outsz) {
+                           const char *ipaddr, const char *ssid,
+                           const char *signal, const char *strength,
+                           const char *down, const char *up, const char *status,
+                           const char *type, const char *icon, char *out,
+                           size_t outsz) {
   const FmtArg args[] = {
       // Longer keys first: format_expand matches by prefix.
       {"{signal-percent}", strength}, {"{}", ifname},
       {"{ifname}", ifname},           {"{ssid}", ssid},
-      {"{essid}", ssid},              {"{signal}", signal},
+      {"{essid}", ssid},              {"{ipaddr}", ipaddr},
+      {"{ip}", ipaddr},               {"{signal}", signal},
       {"{strength}", strength},       {"{percent}", ifname},
       {"{usage}", ifname},            {"{volume}", ifname},
       {"{load}", ifname},             {"{down}", down},
@@ -534,6 +538,7 @@ typedef struct Bar {
   uint8_t alt_on[MANGOBAR_MAX_ALTS];
   char net_ifname[64];
   char net_ssid[64]; // wireless SSID (empty for wired / disconnected)
+  char net_ipaddr[64]; // IPv4 address of the active interface (empty if none)
   bool net_up;   // an active interface with a carrier is present
   int net_kind;  // 0 = unknown, 1 = ethernet, 2 = wifi
   int net_dbm;           // smoothed wireless signal level in dBm
@@ -1376,8 +1381,9 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
         char down[32], up[32];
         format_speed(bar->net_rx_kbps, down, sizeof(down));
         format_speed(bar->net_tx_kbps, up, sizeof(up));
-        format_network(g_cfg.alts[ai].fmt, bar->net_ifname, bar->net_ssid,
-                       signal, strength, down, up, status, type, icon, dst, 256);
+        format_network(g_cfg.alts[ai].fmt, bar->net_ifname, bar->net_ipaddr,
+                       bar->net_ssid, signal, strength, down, up, status, type,
+                       icon, dst, 256);
       } else {
         const char *fmt = g_cfg.network_format;
         if (!bar->net_up) {
@@ -1390,8 +1396,8 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
           if (g_cfg.network_format_ethernet[0])
             fmt = g_cfg.network_format_ethernet;
         }
-        format_network(fmt, bar->net_ifname, bar->net_ssid, signal, strength,
-                       "", "", status, type, icon, dst, 256);
+        format_network(fmt, bar->net_ifname, bar->net_ipaddr, bar->net_ssid,
+                       signal, strength, "", "", status, type, icon, dst, 256);
       }
       ModuleStyle *nst = &g_rt->st_network;
       if (!bar->net_up)
@@ -4266,6 +4272,27 @@ static void iface_wifi_info(const char *ifn, char *ssid, size_t ssidsz,
   close(fd);
 }
 
+// IPv4 address currently assigned to the interface, as a dotted quad
+// (e.g. 192.168.1.10). Empty string when the interface has no IPv4 address.
+static void iface_ipaddr(const char *ifn, char *out, size_t outsz) {
+  if (out && outsz)
+    out[0] = '\0';
+  if (!ifn || !*ifn || !out || !outsz)
+    return;
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0)
+    return;
+  struct ifreq ifr;
+  memset(&ifr, 0, sizeof(ifr));
+  snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", ifn);
+  if (ioctl(fd, SIOCGIFADDR, &ifr) == 0) {
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)&ifr.ifr_addr;
+    if (inet_ntop(AF_INET, &sin->sin_addr, out, outsz) == NULL)
+      out[0] = '\0';
+  }
+  close(fd);
+}
+
 // Detect the interface currently carrying traffic. Prefer the default-route
 // interface with the lowest metric (so ethernet wins over wifi when both are
 // plugged in), then any other interface that is up. Re-run on every poll so a
@@ -4334,6 +4361,11 @@ static void update_network(void) {
   if (up && kind == NET_KIND_WIFI)
     iface_wifi_info(ifname, ssid, sizeof(ssid), &dbm);
 
+  // Internal IPv4 address of the active interface (empty when unaddressed).
+  char ipaddr[64] = "";
+  if (up)
+    iface_ipaddr(ifname, ipaddr, sizeof(ipaddr));
+
   // Smooth the instantaneous RSSI so the icon does not flap between adjacent
   // levels; phones average the reading in much the same way.
   static int smooth_dbm;
@@ -4356,6 +4388,7 @@ static void update_network(void) {
     if (nai >= 0 && b->alt_on[nai])
       need_speed = true;
     snprintf(b->net_ifname, sizeof(b->net_ifname), "%s", ifname);
+    snprintf(b->net_ipaddr, sizeof(b->net_ipaddr), "%s", ipaddr);
     snprintf(b->net_ssid, sizeof(b->net_ssid), "%s", ssid);
     b->net_up = up;
     b->net_kind = kind;

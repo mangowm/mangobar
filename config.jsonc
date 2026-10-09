@@ -47,6 +47,9 @@
     },
 
     "network": {
+        // Placeholders: {ifname}/{} interface, {ipaddr}/{ip} IPv4 address,
+        // {ssid}/{essid}, {signal} icon, {strength}/{signal-percent} percent,
+        // {status}, {type}, {icon}, {down}/{up} (speed in format-alt)
         "format": "{icon} {ifname}",
         "format-wifi": "{signal} {ssid}",
         "format-disconnected": "{icon}",
