@@ -238,6 +238,8 @@ static ProfileRuntime *g_rt; // profile runtime for the bar being drawn
 static MangoConfigSet g_config_set;
 static ProfileRuntime *g_runtimes; // one per profile, indexed by pointer diff
 
+static void menu_margins_calc(MangoBarAnchor anchor, int w, int h, int *ml_out, int *mt_out);
+
 // ---------- Format helpers ----------
 static uint32_t text_metrics(const char *text, int32_t *min_x, int32_t *max_x);
 
@@ -2353,10 +2355,23 @@ static void bar_create_surface(Bar *bar) {
                                      &layer_surface_listener, bar);
   zwlr_layer_surface_v1_set_size(bar->layer_surface, 0,
                                  rt->bar_h + rt->bar_top);
-  zwlr_layer_surface_v1_set_anchor(bar->layer_surface,
-                                   ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                       ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-                                       ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+
+    int anchors; 
+    switch (cfg->bar_anchor) {
+      case MANGO_ANCHOR_BOTTOM:
+        anchors = ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT  | 
+                  ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT | 
+                  ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM;
+        break;
+      case MANGO_ANCHOR_TOP:
+      default:
+        anchors = ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT  | 
+                  ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT | 
+                  ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP;
+        break;
+    }
+
+  zwlr_layer_surface_v1_set_anchor(bar->layer_surface, anchors);
   zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface,
                                            rt->bar_h + rt->bar_top);
   wl_surface_commit(bar->wl_surface);
@@ -2960,6 +2975,7 @@ typedef struct {
   int lx, ly; // trigger position (output-local coords)
   int bar_h; // bar height (logical)
   int out_w, out_h; // output size for bounds clamping
+  MangoBarAnchor bar_anchor;
   MangobarTrayItem *item; // associated tray item
   struct wl_output *output;
   // Side submenu
@@ -3440,20 +3456,8 @@ static void menu_layout_cb(void *data) {
   int rows = vis + (menu_in_submenu(popup.menu) ? 1 : 0);
   uint32_t h = (uint32_t)rows * item_h + MENU_PAD_V * 2;
 
-  // Menu hugs below the systray (no overlap), right-aligned to the click
-  int ml = popup.lx - (int)w;
-  // Position below the systray with the desired gap.
-  int mt = 10;
-  if (mt < 0)
-    mt = 0;
-  if (ml < 0)
-    ml = 0;
-  if (popup.out_w > 0 && ml + (int)w > popup.out_w)
-    ml = popup.out_w - (int)w;
-  if (mt < 0)
-    mt = 0;
-  if (popup.out_h > 0 && mt + (int)h > popup.out_h)
-    mt = popup.out_h - (int)h;
+  int ml, mt;
+  menu_margins_calc(popup.bar_anchor, (int)w, (int)h, &ml, &mt);
   zwlr_layer_surface_v1_set_margin(popup.layer_surface, mt, 0, 0, ml);
   zwlr_layer_surface_v1_set_size(popup.layer_surface, w, h);
   wl_surface_commit(popup.surface);
@@ -3778,12 +3782,15 @@ static void menu_open(Bar *bar, MangobarTrayItem *item, double lx, double ly) {
   popup.bar_h = bar->height / (popup.scale > 0 ? popup.scale : 1);
   popup.out_w = bar->out_w;
   popup.out_h = bar->out_h;
+  popup.bar_anchor = bar->profile->config.bar_anchor;
   IPC_LOG("[menu] open bar_height=%u bar_h=%d lx=%d ly=%d out=%dx%d\n",
           bar->height, popup.bar_h, popup.lx, popup.ly, popup.out_w,
           popup.out_h);
-  // Initial position: below the systray, no overlap
-  int top = 10;
-  int left = popup.lx > 10 ? popup.lx - 10 : 0;
+  // Initial position
+  int top, left;
+
+  menu_margins_calc(popup.bar_anchor, 10, 10, &left, &top);
+
   zwlr_layer_surface_v1_set_margin(popup.layer_surface, top, 0, 0, left);
   zwlr_layer_surface_v1_set_size(popup.layer_surface, 10, 10);
   zwlr_layer_surface_v1_set_exclusive_zone(popup.layer_surface, 0);
@@ -3793,6 +3800,29 @@ static void menu_open(Bar *bar, MangobarTrayItem *item, double lx, double ly) {
   popup.configured = false;
   popup.item = item;
   menu_refresh(popup.menu);
+}
+
+// Called on menu_open and menu_cb: Compute margins with clamping
+static void menu_margins_calc(MangoBarAnchor anchor, int w, int h, int *ml_out, int *mt_out) {
+  const int gap = 10;
+  int ml = popup.lx > 10 ? popup.lx - 10 : 0;
+  int mt;
+
+  if (anchor == MANGO_ANCHOR_BOTTOM) {
+    mt = popup.out_h - popup.bar_h - h - gap;
+  } else {
+    mt = popup.bar_h + gap;
+  }
+
+  if (ml < 0) ml = 0;
+  if (mt < 0) mt = 0;
+  if (popup.out_w > 0 && ml + (int)w > popup.out_w)
+    ml = popup.out_w - (int)w;
+  if (popup.out_h > 0 && mt + (int)h > popup.out_h)
+    mt = popup.out_h - (int)h;
+
+  *ml_out = ml;
+  *mt_out = mt;
 }
 
 // ---------- Pointer input ----------

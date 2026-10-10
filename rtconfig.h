@@ -73,6 +73,11 @@ typedef struct {
   double smooth_scroll_threshold; // -1 = use the global setting
 } MangoAction;
 
+typedef enum {
+  MANGO_ANCHOR_TOP,
+  MANGO_ANCHOR_BOTTOM,
+} MangoBarAnchor;
+
 typedef struct {
   char module[32]; /* internal module name, e.g. "cpu", "custom-power" */
   char fmt[256];   /* format-alt string */
@@ -85,6 +90,7 @@ typedef struct {
 
 typedef struct {
   int bar_height;
+  MangoBarAnchor bar_anchor;
   int buffer_scale;
   int radius_default;
   int layer;
