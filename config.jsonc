@@ -86,6 +86,9 @@
         "on-click": "pamixer -t",
         "on-scroll-up": "pamixer -i 2",
         "on-scroll-down": "pamixer -d 2"
+        // The pointer that crosses a module runs these.
+        // "on-enter": "some-command",
+        // "on-leave": "some-other-command"
     },
     "battery": {
         "format": "{icon} {percent}% {ac}",

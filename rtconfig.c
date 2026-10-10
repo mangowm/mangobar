@@ -234,6 +234,26 @@ static void set_action(const char *module, const char *left,
              scroll_down);
 }
 
+// A separate setter keeps the click setters at their current signature.
+static void set_crossing(const char *module, const char *enter,
+                         const char *leave) {
+  if ((!enter || !*enter) && (!leave || !*leave))
+    return;
+  for (int i = 0; i < parse_target->action_count; i++) {
+    if (strcmp(parse_target->actions[i].module, module) == 0) {
+      cfg_set(parse_target->actions[i].enter,
+              sizeof(parse_target->actions[i].enter), enter);
+      cfg_set(parse_target->actions[i].leave,
+              sizeof(parse_target->actions[i].leave), leave);
+      return;
+    }
+  }
+  add_action(module, NULL, NULL, NULL, NULL, NULL);
+  MangoAction *a = &parse_target->actions[parse_target->action_count - 1];
+  cfg_set(a->enter, sizeof(a->enter), enter);
+  cfg_set(a->leave, sizeof(a->leave), leave);
+}
+
 static void set_alt(const char *module, const char *fmt) {
   if (!module || !fmt || !*fmt)
     return;
@@ -283,6 +303,9 @@ static void set_module_actions(cJSON *m, const char *module) {
              cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-click-right")),
              cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-up")),
              cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-scroll-down")));
+  set_crossing(module,
+               cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-enter")),
+               cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-leave")));
   set_action_interval(module, m);
   set_action_smooth_threshold(module, m);
 }
@@ -379,6 +402,9 @@ static void parse_custom_module(cJSON *obj, const char *name) {
              cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj, "on-click-right")),
              cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj, "on-scroll-up")),
              cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj, "on-scroll-down")));
+  set_crossing(css_name,
+               cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj, "on-enter")),
+               cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj, "on-leave")));
   set_action_smooth_threshold(css_name, obj);
 }
 

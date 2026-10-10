@@ -527,6 +527,7 @@ typedef struct Bar {
   double cpu_load;
   int hideclients;
   int hover_tag; // hovered tag index, -1 = none
+  char hover_module[64]; // module under the pointer, empty = none
   int battery_pct[MANGOBAR_MAX_BATTERIES];
   bool battery_present[MANGOBAR_MAX_BATTERIES];
   bool battery_on_ac[MANGOBAR_MAX_BATTERIES];
@@ -2895,6 +2896,52 @@ static void handle_module_action(Bar *bar, const char *module, int tag,
     sys_refresh = true;
 }
 
+// ---------- Pointer crossing ----------
+
+static void run_crossing(const char *module, bool entering) {
+  if (!module || !*module)
+    return;
+  const MangoAction *ma = find_action(module);
+  if (!ma)
+    return;
+  const char *cmd = entering ? ma->enter : ma->leave;
+  if (!cmd || !*cmd)
+    return;
+  IPC_LOG("[cross] module=%s %s cmd='%s'\n", module,
+          entering ? "enter" : "leave", cmd);
+  run_command(cmd);
+}
+
+// An empty name means the pointer is between two modules.
+static void hovered_module(const Bar *bar, double x, char *out, size_t max) {
+  out[0] = '\0';
+  if (!bar)
+    return;
+  for (int i = 0; i < bar->hotspot_count; i++) {
+    const Hotspot *h = &bar->hotspots[i];
+    if (x >= h->x1 && x < h->x2) {
+      snprintf(out, max, "%s", h->module);
+      return;
+    }
+  }
+}
+
+// Run the leave of the old module before the enter of the new one.
+static void update_crossing(Bar *bar, double x, bool inside) {
+  if (!bar)
+    return;
+  char now[64];
+  if (inside)
+    hovered_module(bar, x, now, sizeof(now));
+  else
+    now[0] = '\0';
+  if (strcmp(now, bar->hover_module) == 0)
+    return;
+  run_crossing(bar->hover_module, false);
+  snprintf(bar->hover_module, sizeof(bar->hover_module), "%s", now);
+  run_crossing(bar->hover_module, true);
+}
+
 static void menu_open(Bar *bar, MangobarTrayItem *item, double lx, double ly);
 static void tray_right_click(Bar *bar, double x, double y);
 
@@ -3871,6 +3918,7 @@ static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
     pointer_bar = b;
     break;
   }
+  update_crossing(pointer_bar, pointer_x, true);
   if (cursor_theme) {
     struct wl_cursor *cur = wl_cursor_theme_get_cursor(cursor_theme, "default");
     if (cur) {
@@ -3898,6 +3946,7 @@ static void wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
   frame_has_axis = false;
   axis_stop_mask = 0;
   if (pointer_bar) {
+    update_crossing(pointer_bar, pointer_x, false);
     pointer_bar->hover_tag = -1;
     pointer_bar->redraw = true;
   }
@@ -3923,6 +3972,7 @@ static void wl_pointer_motion(void *data, struct wl_pointer *wl_pointer,
       pointer_bar->hover_tag = hover;
       pointer_bar->redraw = true;
     }
+    update_crossing(pointer_bar, pointer_x, true);
   }
   if (popup_pointer && pointer_on_sub) {
     int row = popup.item_h > 0 ? (int)(pointer_y / popup.item_h) : -1;
