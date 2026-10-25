@@ -587,6 +587,7 @@ static bool running = true;
 
 static struct wl_seat *seat;
 static struct wl_pointer *pointer;
+static struct wl_touch *touch;
 static struct wl_cursor_theme *cursor_theme;
 static struct wl_surface *cursor_surface;
 static Bar *pointer_bar;
@@ -599,6 +600,32 @@ static double axis_smooth_remainder[2];
 static bool frame_has_axis;            // axis events arrived since last frame
 static uint8_t axis_stop_mask;         // axes that reported gesture end
 static bool sys_refresh; // force immediate system info refresh
+
+typedef enum {
+  TOUCH_TARGET_NONE,
+  TOUCH_TARGET_BAR,
+  TOUCH_TARGET_MENU,
+  TOUCH_TARGET_SUBMENU,
+  TOUCH_TARGET_GRAB,
+} TouchTarget;
+
+typedef struct {
+  bool active;
+  int32_t id;
+  struct wl_surface *surface;
+  Bar *bar;
+  TouchTarget target;
+  double down_x, down_y;
+  double last_x, last_y;
+  bool dismiss_menu;
+  bool moved;
+} TouchState;
+
+static TouchState touch_state;
+
+static void touch_state_reset(void) {
+  memset(&touch_state, 0, sizeof(touch_state));
+}
 
 // Persistent PulseAudio context: volume changes arrive via subscription
 static pa_mainloop *pa_ml;
@@ -632,6 +659,7 @@ static int custom_signal_count;
 static int signal_fd = -1;
 
 static const struct wl_pointer_listener pointer_listener;
+static const struct wl_touch_listener touch_listener;
 
 static MangobarTray *tray;
 
@@ -2323,6 +2351,8 @@ static void profile_custom_force_refresh(MangoConfigProfile *profile);
 
 // Destroy the layer surface for a bar, if any.
 static void bar_destroy_surface(Bar *bar) {
+  if (touch_state.surface == bar->wl_surface)
+    touch_state_reset();
   bar_clear_slots(bar);
   bar_free_layers(bar);
   bar_free_buffers(bar);
@@ -2430,12 +2460,21 @@ static const struct zxdg_output_v1_listener output_listener = {
 static void seat_capabilities(void *data, struct wl_seat *wl_seat,
                               uint32_t capabilities) {
   bool has_pointer = capabilities & WL_SEAT_CAPABILITY_POINTER;
+  bool has_touch = capabilities & WL_SEAT_CAPABILITY_TOUCH;
   if (has_pointer && !pointer) {
     pointer = wl_seat_get_pointer(wl_seat);
     wl_pointer_add_listener(pointer, &pointer_listener, NULL);
   } else if (!has_pointer && pointer) {
     wl_pointer_release(pointer);
     pointer = NULL;
+  }
+  if (has_touch && !touch) {
+    touch = wl_seat_get_touch(wl_seat);
+    wl_touch_add_listener(touch, &touch_listener, NULL);
+  } else if (!has_touch && touch) {
+    touch_state_reset();
+    wl_touch_release(touch);
+    touch = NULL;
   }
 }
 
@@ -2994,6 +3033,7 @@ static bool popup_pointer; // whether pointer is on the popup
 static bool pointer_on_sub; // whether pointer is on the submenu
 
 static void draw_menu_popup(void);
+static void draw_submenu(void);
 static void menu_layout_cb(void *data);
 static void submenu_destroy_surface(void);
 static void submenu_close(void);
@@ -3004,6 +3044,10 @@ static void grab_destroy(void);
 static void menu_close(void) {
   if (!popup.open)
     return;
+  if (touch_state.surface == popup.surface ||
+      touch_state.surface == popup.sub_surface ||
+      touch_state.surface == popup.grab_surface)
+    touch_state_reset();
   grab_destroy();
   submenu_destroy_surface();
   if (popup.layer_surface)
@@ -3082,9 +3126,24 @@ static void update_menu_hover(double y) {
   }
 }
 
+static void update_submenu_hover(double y) {
+  if (!popup.sub_open || !popup.sub_node)
+    return;
+  int row = popup.item_h > 0 ? (int)(y / popup.item_h) : -1;
+  int vis = menu_node_visible_count(popup.sub_node);
+  if (row >= vis)
+    row = -1;
+  if (row != popup.sub_hover) {
+    popup.sub_hover = row;
+    if (popup.sub_configured)
+      draw_submenu();
+  }
+}
+
 // Auto-open a submenu after hovering ~300ms
 static void menu_hover_tick(void) {
-  if (!popup.open || !popup_pointer || pointer_on_sub || popup.hover < 0)
+  if (!popup.open || !popup_pointer || pointer_on_sub || popup.hover < 0 ||
+      touch_state.active)
     return;
   const MangobarMenuNode *n = menu_visible_node(popup.menu, popup.hover);
   if (popup.sub_open && popup.sub_node != n)
@@ -3107,6 +3166,14 @@ static void menu_activate_row(int row) {
     return;
   }
   if (!n->enabled)
+    return;
+  menu_activate(popup.menu, n, (uint32_t)now_ms());
+  menu_close();
+}
+
+static void menu_activate_submenu_row(int row) {
+  const MangobarMenuNode *n = menu_node_visible_node(popup.sub_node, row);
+  if (!n || !n->enabled)
     return;
   menu_activate(popup.menu, n, (uint32_t)now_ms());
   menu_close();
@@ -3469,6 +3536,8 @@ static void menu_layout_cb(void *data) {
 
 // ---------- Submenu (side popup) ----------
 static void submenu_destroy_surface(void) {
+  if (touch_state.surface == popup.sub_surface)
+    touch_state_reset();
   if (popup.sub_layer_surface)
     zwlr_layer_surface_v1_destroy(popup.sub_layer_surface);
   if (popup.sub_surface)
@@ -3737,6 +3806,8 @@ static void grab_create(Bar *bar) {
 }
 
 static void grab_destroy(void) {
+  if (touch_state.surface == popup.grab_surface)
+    touch_state_reset();
   if (popup.grab_layer_surface)
     zwlr_layer_surface_v1_destroy(popup.grab_layer_surface);
   if (popup.grab_surface)
@@ -3830,14 +3901,7 @@ static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
       popup_pointer = true;
       pointer_on_sub = true;
       popup.outside_since = 0;
-      int row = popup.item_h > 0 ? (int)(pointer_y / popup.item_h) : -1;
-      int vis = menu_node_visible_count(popup.sub_node);
-      if (row >= vis)
-        row = -1;
-      if (row != popup.sub_hover) {
-        popup.sub_hover = row;
-        draw_submenu();
-      }
+      update_submenu_hover(pointer_y);
     } else if (popup.grab_surface && surface == popup.grab_surface) {
       // Grab layer: keep the menu open; button handler closes it
       popup_pointer = false;
@@ -3929,14 +3993,7 @@ static void wl_pointer_motion(void *data, struct wl_pointer *wl_pointer,
     }
   }
   if (popup_pointer && pointer_on_sub) {
-    int row = popup.item_h > 0 ? (int)(pointer_y / popup.item_h) : -1;
-    int vis = menu_node_visible_count(popup.sub_node);
-    if (row >= vis)
-      row = -1;
-    if (row != popup.sub_hover) {
-      popup.sub_hover = row;
-      draw_submenu();
-    }
+    update_submenu_hover(pointer_y);
   } else if (popup_pointer) {
     update_menu_hover(pointer_y);
   }
@@ -3952,12 +4009,7 @@ static void wl_pointer_button(void *data, struct wl_pointer *wl_pointer,
           popup.open);
   if (popup.open) {
     if (popup_pointer && pointer_on_sub && popup.sub_open) {
-      const MangobarMenuNode *n =
-          menu_node_visible_node(popup.sub_node, popup.sub_hover);
-      if (n && n->enabled) {
-        menu_activate(popup.menu, n, (uint32_t)now_ms());
-        menu_close();
-      }
+      menu_activate_submenu_row(popup.sub_hover);
     } else if (popup_pointer) {
       menu_activate_row(popup.hover);
     } else {
@@ -4077,6 +4129,157 @@ static const struct wl_pointer_listener pointer_listener = {
     .axis_source = wl_pointer_axis_source,
     .axis_stop = wl_pointer_axis_stop,
     .axis_discrete = wl_pointer_axis_discrete,
+};
+
+// ---------- Touch input ----------
+#define TOUCH_TAP_SLOP 16.0
+
+static Bar *bar_for_surface(struct wl_surface *surface) {
+  Bar *bar;
+  wl_list_for_each(bar, &bar_list, link) if (bar->wl_surface == surface)
+      return bar;
+  return NULL;
+}
+
+static TouchTarget touch_target_at(struct wl_surface *surface, Bar **bar) {
+  *bar = NULL;
+  if (!surface)
+    return TOUCH_TARGET_NONE;
+  if (popup.open) {
+    if (surface == popup.surface)
+      return TOUCH_TARGET_MENU;
+    if (popup.sub_open && surface == popup.sub_surface)
+      return TOUCH_TARGET_SUBMENU;
+    if (surface == popup.grab_surface)
+      return TOUCH_TARGET_GRAB;
+  }
+  *bar = bar_for_surface(surface);
+  return *bar ? TOUCH_TARGET_BAR : TOUCH_TARGET_NONE;
+}
+
+static void touch_activate_tap(void) {
+  switch (touch_state.target) {
+  case TOUCH_TARGET_BAR:
+    // A tap while a tray menu is open dismisses it, matching a left click.
+    if (touch_state.dismiss_menu || popup.open)
+      menu_close();
+    else if (touch_state.bar)
+      dispatch_pointer_event(touch_state.bar, touch_state.last_x,
+                             touch_state.last_y, BTN_LEFT);
+    break;
+  case TOUCH_TARGET_MENU:
+    if (popup.open && touch_state.surface == popup.surface) {
+      update_menu_hover(touch_state.last_y);
+      if (popup.hover >= 0)
+        menu_activate_row(popup.hover);
+    }
+    break;
+  case TOUCH_TARGET_SUBMENU:
+    if (popup.open && popup.sub_open &&
+        touch_state.surface == popup.sub_surface) {
+      update_submenu_hover(touch_state.last_y);
+      if (popup.sub_hover >= 0)
+        menu_activate_submenu_row(popup.sub_hover);
+    }
+    break;
+  case TOUCH_TARGET_GRAB:
+    if (popup.open)
+      menu_close();
+    break;
+  case TOUCH_TARGET_NONE:
+    break;
+  }
+}
+
+static void wl_touch_down(void *data, struct wl_touch *wl_touch,
+                          uint32_t serial, uint32_t time,
+                          struct wl_surface *surface, int32_t id,
+                          wl_fixed_t surface_x, wl_fixed_t surface_y) {
+  if (touch_state.active) {
+    IPC_LOG("[touch] down id=%d ignored while id=%d is active\n", id,
+            touch_state.id);
+    return;
+  }
+  double x = wl_fixed_to_double(surface_x);
+  double y = wl_fixed_to_double(surface_y);
+  Bar *bar = NULL;
+  TouchTarget target = touch_target_at(surface, &bar);
+  touch_state.active = true;
+  touch_state.id = id;
+  touch_state.surface = surface;
+  touch_state.bar = bar;
+  touch_state.target = target;
+  touch_state.down_x = touch_state.last_x = x;
+  touch_state.down_y = touch_state.last_y = y;
+  touch_state.dismiss_menu = target == TOUCH_TARGET_BAR && popup.open;
+  touch_state.moved = false;
+  IPC_LOG("[touch] down id=%d x=%.1f y=%.1f bar=%s target=%d\n", id, x, y,
+          bar ? bar->name : "-", target);
+  if (target == TOUCH_TARGET_MENU)
+    update_menu_hover(y);
+  else if (target == TOUCH_TARGET_SUBMENU)
+    update_submenu_hover(y);
+}
+
+static void wl_touch_up(void *data, struct wl_touch *wl_touch,
+                        uint32_t serial, uint32_t time, int32_t id) {
+  if (!touch_state.active || touch_state.id != id)
+    return;
+  IPC_LOG("[touch] up id=%d x=%.1f y=%.1f target=%d moved=%d\n", id,
+          touch_state.last_x, touch_state.last_y, touch_state.target,
+          touch_state.moved);
+  if (!touch_state.moved)
+    touch_activate_tap();
+  touch_state_reset();
+}
+
+static void wl_touch_motion(void *data, struct wl_touch *wl_touch,
+                            uint32_t time, int32_t id, wl_fixed_t surface_x,
+                            wl_fixed_t surface_y) {
+  if (!touch_state.active || touch_state.id != id)
+    return;
+  double x = wl_fixed_to_double(surface_x);
+  double y = wl_fixed_to_double(surface_y);
+  double dx = x - touch_state.down_x;
+  double dy = y - touch_state.down_y;
+  touch_state.last_x = x;
+  touch_state.last_y = y;
+  if (dx * dx + dy * dy > TOUCH_TAP_SLOP * TOUCH_TAP_SLOP) {
+    touch_state.moved = true;
+    return;
+  }
+  if (touch_state.target == TOUCH_TARGET_MENU)
+    update_menu_hover(y);
+  else if (touch_state.target == TOUCH_TARGET_SUBMENU)
+    update_submenu_hover(y);
+}
+
+static void wl_touch_frame(void *data, struct wl_touch *wl_touch) {
+}
+
+static void wl_touch_cancel(void *data, struct wl_touch *wl_touch) {
+  if (touch_state.active)
+    IPC_LOG("[touch] cancel id=%d target=%d\n", touch_state.id,
+            touch_state.target);
+  touch_state_reset();
+}
+
+static void wl_touch_shape(void *data, struct wl_touch *wl_touch, int32_t id,
+                           wl_fixed_t major, wl_fixed_t minor) {
+}
+
+static void wl_touch_orientation(void *data, struct wl_touch *wl_touch,
+                                 int32_t id, wl_fixed_t orientation) {
+}
+
+static const struct wl_touch_listener touch_listener = {
+    .down = wl_touch_down,
+    .up = wl_touch_up,
+    .motion = wl_touch_motion,
+    .frame = wl_touch_frame,
+    .cancel = wl_touch_cancel,
+    .shape = wl_touch_shape,
+    .orientation = wl_touch_orientation,
 };
 
 // ---------- System info (CPU / mem / backlight / volume / time) ----------
