@@ -45,6 +45,7 @@
 #include "rtconfig.h"
 #include "style.h"
 #include "tray.h"
+#include "cursor-shape-v1-protocol.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 #include "xdg-output-unstable-v1-protocol.h"
 #include "xdg-shell-protocol.h"
@@ -588,8 +589,28 @@ static bool running = true;
 static struct wl_seat *seat;
 static struct wl_pointer *pointer;
 static struct wl_touch *touch;
-static struct wl_cursor_theme *cursor_theme;
+
+typedef struct CursorTheme {
+  int scale;
+  struct wl_cursor_theme *theme;
+  struct wl_cursor *cursor;
+  struct CursorTheme *next;
+} CursorTheme;
+
+// Themes are kept alive per scale: switching outputs may still leave a buffer
+// from the previous theme attached to the cursor surface.
 static struct wl_surface *cursor_surface;
+static CursorTheme *cursor_themes;
+static struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
+static struct wp_cursor_shape_device_v1 *cursor_shape_device;
+static struct wl_surface *cursor_enter_surface;
+static uint32_t cursor_enter_serial;
+
+static void cursor_shape_device_create(void);
+static void cursor_shape_device_destroy(void);
+static void cursor_refresh(void);
+static void cursor_forget_surface(struct wl_surface *surface);
+
 static Bar *pointer_bar;
 static double pointer_x, pointer_y;
 static int axis_steps[2];
@@ -2330,6 +2351,8 @@ static void wl_output_scale(void *data, struct wl_output *output,
   if (scale == bar->scale)
     return;
   bar->scale = scale;
+  if (cursor_enter_surface == bar->wl_surface)
+    cursor_refresh();
   if (bar->configured) {
     bar->width = bar->logical_w * (uint32_t)scale;
     bar->height = bar->logical_h * (uint32_t)scale;
@@ -2353,6 +2376,7 @@ static void profile_custom_force_refresh(MangoConfigProfile *profile);
 static void bar_destroy_surface(Bar *bar) {
   if (touch_state.surface == bar->wl_surface)
     touch_state_reset();
+  cursor_forget_surface(bar->wl_surface);
   bar_clear_slots(bar);
   bar_free_layers(bar);
   bar_free_buffers(bar);
@@ -2464,7 +2488,11 @@ static void seat_capabilities(void *data, struct wl_seat *wl_seat,
   if (has_pointer && !pointer) {
     pointer = wl_seat_get_pointer(wl_seat);
     wl_pointer_add_listener(pointer, &pointer_listener, NULL);
+    cursor_shape_device_create();
   } else if (!has_pointer && pointer) {
+    cursor_shape_device_destroy();
+    cursor_enter_surface = NULL;
+    cursor_enter_serial = 0;
     wl_pointer_release(pointer);
     pointer = NULL;
   }
@@ -2496,7 +2524,13 @@ static void registry_global(void *data, struct wl_registry *registry,
   else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0)
     layer_shell =
         wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface, 1);
-  else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
+  else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
+    cursor_shape_manager =
+        wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface,
+                         1);
+    if (pointer)
+      cursor_shape_device_create();
+  } else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
     output_manager =
         wl_registry_bind(registry, name, &zxdg_output_manager_v1_interface, 2);
     // wl_output may have been announced before the xdg-output manager.
@@ -3052,6 +3086,7 @@ static void menu_close(void) {
   submenu_destroy_surface();
   if (popup.layer_surface)
     zwlr_layer_surface_v1_destroy(popup.layer_surface);
+  cursor_forget_surface(popup.surface);
   if (popup.surface)
     wl_surface_destroy(popup.surface);
   menu_destroy(popup.menu);
@@ -3540,6 +3575,7 @@ static void submenu_destroy_surface(void) {
     touch_state_reset();
   if (popup.sub_layer_surface)
     zwlr_layer_surface_v1_destroy(popup.sub_layer_surface);
+  cursor_forget_surface(popup.sub_surface);
   if (popup.sub_surface)
     wl_surface_destroy(popup.sub_surface);
   popup.sub_layer_surface = NULL;
@@ -3810,6 +3846,7 @@ static void grab_destroy(void) {
     touch_state_reset();
   if (popup.grab_layer_surface)
     zwlr_layer_surface_v1_destroy(popup.grab_layer_surface);
+  cursor_forget_surface(popup.grab_surface);
   if (popup.grab_surface)
     wl_surface_destroy(popup.grab_surface);
   if (popup.grab_buffer)
@@ -3871,11 +3908,7 @@ static void menu_open(Bar *bar, MangobarTrayItem *item, double lx, double ly) {
 }
 
 // ---------- Pointer input ----------
-static void setup_cursor() {
-  if (cursor_surface || !compositor)
-    return;
-  cursor_surface = wl_compositor_create_surface(compositor);
-  const char *theme_name = getenv("XCURSOR_THEME");
+static int cursor_logical_size(void) {
   int size = 24;
   const char *es = getenv("XCURSOR_SIZE");
   if (es && *es) {
@@ -3883,7 +3916,107 @@ static void setup_cursor() {
     if (v > 0)
       size = v;
   }
-  cursor_theme = wl_cursor_theme_load(theme_name, size, shm);
+  return size;
+}
+
+static CursorTheme *cursor_theme_for_scale(int scale) {
+  if (scale < 1)
+    scale = 1;
+  for (CursorTheme *ct = cursor_themes; ct; ct = ct->next)
+    if (ct->scale == scale)
+      return ct;
+  const char *theme_name = getenv("XCURSOR_THEME");
+  struct wl_cursor_theme *theme =
+      wl_cursor_theme_load(theme_name, cursor_logical_size() * scale, shm);
+  if (!theme)
+    return NULL;
+  CursorTheme *ct = calloc(1, sizeof(*ct));
+  if (!ct) {
+    wl_cursor_theme_destroy(theme);
+    return NULL;
+  }
+  ct->scale = scale;
+  ct->theme = theme;
+  ct->cursor = wl_cursor_theme_get_cursor(theme, "default");
+  ct->next = cursor_themes;
+  cursor_themes = ct;
+  return ct;
+}
+
+static int cursor_scale_for_surface(struct wl_surface *surface) {
+  if (!surface)
+    return 1;
+  Bar *bar;
+  wl_list_for_each(bar, &bar_list, link) {
+    if (bar->wl_surface == surface)
+      return bar->scale > 0 ? bar->scale : 1;
+  }
+  if (popup.open &&
+      (surface == popup.surface || surface == popup.sub_surface ||
+       surface == popup.grab_surface))
+    return popup.scale > 0 ? popup.scale : 1;
+  return 1;
+}
+
+static void cursor_set_fallback(uint32_t serial, struct wl_surface *surface) {
+  if (!pointer || !cursor_surface)
+    return;
+  int scale = cursor_scale_for_surface(surface);
+  CursorTheme *ct = cursor_theme_for_scale(scale);
+  if (!ct || !ct->cursor || ct->cursor->image_count == 0)
+    return;
+  struct wl_cursor_image *img = ct->cursor->images[0];
+  struct wl_buffer *buffer = wl_cursor_image_get_buffer(img);
+  if (!buffer)
+    return;
+  wl_surface_set_buffer_scale(cursor_surface, scale);
+  wl_surface_attach(cursor_surface, buffer, 0, 0);
+  wl_pointer_set_cursor(pointer, serial, cursor_surface,
+                        img->hotspot_x / scale, img->hotspot_y / scale);
+  wl_surface_damage_buffer(cursor_surface, 0, 0, INT32_MAX, INT32_MAX);
+  wl_surface_commit(cursor_surface);
+}
+
+static void cursor_refresh(void) {
+  if (!pointer || !cursor_enter_surface)
+    return;
+  if (cursor_shape_device) {
+    wp_cursor_shape_device_v1_set_shape(
+        cursor_shape_device, cursor_enter_serial,
+        WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+    return;
+  }
+  cursor_set_fallback(cursor_enter_serial, cursor_enter_surface);
+}
+
+static void cursor_shape_device_create(void) {
+  if (!cursor_shape_manager || !pointer)
+    return;
+  if (cursor_shape_device)
+    wp_cursor_shape_device_v1_destroy(cursor_shape_device);
+  cursor_shape_device = wp_cursor_shape_manager_v1_get_pointer(
+      cursor_shape_manager, pointer);
+  cursor_refresh();
+}
+
+static void cursor_shape_device_destroy(void) {
+  if (!cursor_shape_device)
+    return;
+  wp_cursor_shape_device_v1_destroy(cursor_shape_device);
+  cursor_shape_device = NULL;
+}
+
+static void cursor_forget_surface(struct wl_surface *surface) {
+  if (surface && cursor_enter_surface == surface) {
+    cursor_enter_surface = NULL;
+    cursor_enter_serial = 0;
+  }
+}
+
+static void setup_cursor(void) {
+  if (cursor_surface || !compositor)
+    return;
+  cursor_surface = wl_compositor_create_surface(compositor);
 }
 
 static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
@@ -3939,21 +4072,15 @@ static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
     pointer_bar = b;
     break;
   }
-  if (cursor_theme) {
-    struct wl_cursor *cur = wl_cursor_theme_get_cursor(cursor_theme, "default");
-    if (cur) {
-      struct wl_cursor_image *img = cur->images[0];
-      wl_surface_attach(cursor_surface, wl_cursor_image_get_buffer(img), 0, 0);
-      wl_pointer_set_cursor(pointer, serial, cursor_surface, img->hotspot_x,
-                            img->hotspot_y);
-      wl_surface_damage_buffer(cursor_surface, 0, 0, INT32_MAX, INT32_MAX);
-      wl_surface_commit(cursor_surface);
-    }
-  }
+  cursor_enter_surface = surface;
+  cursor_enter_serial = serial;
+  cursor_refresh();
 }
 
 static void wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
                              uint32_t serial, struct wl_surface *surface) {
+  cursor_enter_surface = NULL;
+  cursor_enter_serial = 0;
   if (popup.open) {
     // Pointer left our surfaces; close after the outside threshold.
     popup.outside_since = now_ms();
