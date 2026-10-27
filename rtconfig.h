@@ -69,6 +69,8 @@ typedef struct {
   char right[256];
   char scroll_up[256];
   char scroll_down[256];
+  char enter[256];
+  char leave[256];
   int scroll_interval; // ms; -1 = use the global setting
   double smooth_scroll_threshold; // -1 = use the global setting
 } MangoAction;
