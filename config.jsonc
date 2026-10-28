@@ -1,6 +1,7 @@
 // mangobar config (JSONC).
 {
     "layer": "top",
+    "anchor": "top",
     "height": 30,
     "buffer-scale": 1,
     // "scroll-interval": 100,
