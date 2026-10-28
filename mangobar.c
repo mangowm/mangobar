@@ -38,10 +38,10 @@
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
-#include <wayland-cursor.h>
 #include <wayland-util.h>
 #include <xkbcommon/xkbregistry.h>
 
+#include "cursor-shape-v1-protocol.h"
 #include "menu.h"
 #include "defaults.h"
 #include "rtconfig.h"
@@ -597,8 +597,8 @@ static bool running = true;
 static struct wl_seat *seat;
 static struct wl_pointer *pointer;
 static struct wl_touch *touch;
-static struct wl_cursor_theme *cursor_theme;
-static struct wl_surface *cursor_surface;
+static struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
+static struct wp_cursor_shape_device_v1 *cursor_shape_device;
 static Bar *pointer_bar;
 static double pointer_x, pointer_y;
 static int axis_steps[2];
@@ -612,6 +612,9 @@ static bool sys_refresh; // force immediate system info refresh
 
 static struct rxkb_context *kb_layout_registry;
 static bool kb_layout_registry_ready;
+
+static void cursor_shape_device_create(void);
+static void cursor_shape_device_destroy(void);
 
 static void format_keyboardlayout(const char *fmt,
                                   const KeyboardLayoutInfo *layout, char *out,
@@ -2562,7 +2565,9 @@ static void seat_capabilities(void *data, struct wl_seat *wl_seat,
   if (has_pointer && !pointer) {
     pointer = wl_seat_get_pointer(wl_seat);
     wl_pointer_add_listener(pointer, &pointer_listener, NULL);
+    cursor_shape_device_create();
   } else if (!has_pointer && pointer) {
+    cursor_shape_device_destroy();
     wl_pointer_release(pointer);
     pointer = NULL;
   }
@@ -2594,7 +2599,13 @@ static void registry_global(void *data, struct wl_registry *registry,
   else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0)
     layer_shell =
         wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface, 1);
-  else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
+  else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
+    cursor_shape_manager =
+        wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface,
+                         1);
+    if (pointer)
+      cursor_shape_device_create();
+  } else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
     output_manager =
         wl_registry_bind(registry, name, &zxdg_output_manager_v1_interface, 2);
     // wl_output may have been announced before the xdg-output manager.
@@ -3969,19 +3980,19 @@ static void menu_open(Bar *bar, MangobarTrayItem *item, double lx, double ly) {
 }
 
 // ---------- Pointer input ----------
-static void setup_cursor() {
-  if (cursor_surface || !compositor)
+static void cursor_shape_device_create(void) {
+  if (!cursor_shape_manager || !pointer)
     return;
-  cursor_surface = wl_compositor_create_surface(compositor);
-  const char *theme_name = getenv("XCURSOR_THEME");
-  int size = 24;
-  const char *es = getenv("XCURSOR_SIZE");
-  if (es && *es) {
-    int v = atoi(es);
-    if (v > 0)
-      size = v;
-  }
-  cursor_theme = wl_cursor_theme_load(theme_name, size, shm);
+  cursor_shape_device_destroy();
+  cursor_shape_device =
+      wp_cursor_shape_manager_v1_get_pointer(cursor_shape_manager, pointer);
+}
+
+static void cursor_shape_device_destroy(void) {
+  if (!cursor_shape_device)
+    return;
+  wp_cursor_shape_device_v1_destroy(cursor_shape_device);
+  cursor_shape_device = NULL;
 }
 
 static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
@@ -4037,17 +4048,9 @@ static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
     pointer_bar = b;
     break;
   }
-  if (cursor_theme) {
-    struct wl_cursor *cur = wl_cursor_theme_get_cursor(cursor_theme, "default");
-    if (cur) {
-      struct wl_cursor_image *img = cur->images[0];
-      wl_surface_attach(cursor_surface, wl_cursor_image_get_buffer(img), 0, 0);
-      wl_pointer_set_cursor(pointer, serial, cursor_surface, img->hotspot_x,
-                            img->hotspot_y);
-      wl_surface_damage_buffer(cursor_surface, 0, 0, INT32_MAX, INT32_MAX);
-      wl_surface_commit(cursor_surface);
-    }
-  }
+  if (cursor_shape_device)
+    wp_cursor_shape_device_v1_set_shape(
+        cursor_shape_device, serial, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
 }
 
 static void wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
@@ -5791,7 +5794,11 @@ int main(int argc, char **argv) {
   if (!compositor || !shm || !layer_shell || !output_manager)
     return 1;
 
-  setup_cursor();
+  if (!cursor_shape_manager) {
+    fprintf(stderr,
+            "mangobar: compositor does not support cursor-shape-v1\n");
+    return 1;
+  }
 
   tray = tray_init(tray_set_dirty);
 

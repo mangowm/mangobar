@@ -15,7 +15,6 @@ add_project_arguments('-D' + 'SDBUS_' + sdbus_dep.name().to_upper(), language: '
 deps = [
   dependency('threads'),
   dependency('wayland-client'),
-  dependency('wayland-cursor'),
   dependency('fcft'),
   dependency('pixman-1'),
   dependency('cairo'),
@@ -45,6 +44,8 @@ gen_code = generator(scanner,
 
 xdg_shell_xml = proto_dir / 'stable/xdg-shell/xdg-shell.xml'
 xdg_output_xml = proto_dir / 'unstable/xdg-output/xdg-output-unstable-v1.xml'
+cursor_shape_xml = 'protocols/cursor-shape-v1.xml'
+tablet_xml = proto_dir / 'stable/tablet/tablet-v2.xml'
 wlr_layer_xml = 'protocols/wlr-layer-shell-unstable-v1.xml'
 
 xdg_shell_h = gen_header.process(xdg_shell_xml)
@@ -52,6 +53,12 @@ xdg_shell_c = gen_code.process(xdg_shell_xml)
 
 xdg_output_h = gen_header.process(xdg_output_xml)
 xdg_output_c = gen_code.process(xdg_output_xml)
+
+cursor_shape_h = gen_header.process(cursor_shape_xml)
+cursor_shape_c = gen_code.process(cursor_shape_xml)
+
+tablet_h = gen_header.process(tablet_xml)
+tablet_c = gen_code.process(tablet_xml)
 
 wlr_layer_h = gen_header.process(wlr_layer_xml)
 wlr_layer_c = gen_code.process(wlr_layer_xml)
@@ -73,6 +80,8 @@ executable('mangobar',
     defaults_h,
     xdg_shell_h, xdg_shell_c,
     xdg_output_h, xdg_output_c,
+    cursor_shape_h, cursor_shape_c,
+    tablet_h, tablet_c,
     wlr_layer_h, wlr_layer_c,
     'mangobar.c',
     'rtconfig.c',
