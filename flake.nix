@@ -39,6 +39,7 @@
               fcft
               gdk-pixbuf
               libpulseaudio
+              libxkbcommon
               pango
               pixman
               systemd

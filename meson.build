@@ -25,6 +25,7 @@ deps = [
   sdbus_dep,
   dependency('libudev'),
   dependency('gdk-pixbuf-2.0'),
+  dependency('xkbregistry'),
   cc.find_library('rt'),
   cc.find_library('cjson'),
 ]

@@ -45,6 +45,9 @@
         "on-click": "bash ~/.config/mango/scripts/screenshot.sh",
         "on-click-right": "python /home/wrq/tool/ocr.py"
     },
+    "keyboardlayout": {
+        "format": "{short}"
+    },
 
     "network": {
         // Placeholders: {ifname}/{} interface, {ipaddr}/{ip} IPv4 address,

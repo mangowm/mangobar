@@ -2,6 +2,7 @@
 #include <cairo/cairo.h>
 #include <cjson/cJSON.h>
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <math.h>
 #include <net/if.h>
 #include <pango/pango.h>
@@ -39,6 +40,7 @@
 #include <wayland-client.h>
 #include <wayland-cursor.h>
 #include <wayland-util.h>
+#include <xkbcommon/xkbregistry.h>
 
 #include "menu.h"
 #include "defaults.h"
@@ -500,6 +502,13 @@ typedef struct {
   int idx;
 } BarBufTag;
 
+typedef struct {
+  char full[64];
+  char short_name[16];
+  char variant[64];
+  char short_description[16];
+} KeyboardLayoutInfo;
+
 typedef struct Bar {
   struct wl_output *wl_output;
   struct wl_surface *wl_surface;
@@ -522,7 +531,7 @@ typedef struct Bar {
   char title[256];
   char appid[128];
   char keymode[32];
-  char kb_layout[16];
+  KeyboardLayoutInfo kb_layout;
   int cpu_pct, mem_pct;
   double cpu_load;
   int hideclients;
@@ -600,6 +609,94 @@ static double axis_smooth_remainder[2];
 static bool frame_has_axis;            // axis events arrived since last frame
 static uint8_t axis_stop_mask;         // axes that reported gesture end
 static bool sys_refresh; // force immediate system info refresh
+
+static struct rxkb_context *kb_layout_registry;
+static bool kb_layout_registry_ready;
+
+static void format_keyboardlayout(const char *fmt,
+                                  const KeyboardLayoutInfo *layout, char *out,
+                                  size_t outsz) {
+  if (!fmt || !*fmt) {
+    snprintf(out, outsz, "%s", layout->full);
+    return;
+  }
+  const FmtArg args[] = {{"{}", layout->full},
+                         {"{long}", layout->full},
+                         {"{short}", layout->short_name},
+                         {"{shortDescription}", layout->short_description},
+                         {"{variant}", layout->variant}};
+  format_expand(fmt, args, LENGTH(args), out, outsz);
+}
+
+static bool keyboard_layout_registry_init(void) {
+  if (kb_layout_registry_ready)
+    return kb_layout_registry != NULL;
+  kb_layout_registry_ready = true;
+  kb_layout_registry = rxkb_context_new(RXKB_CONTEXT_LOAD_EXOTIC_RULES);
+  if (!kb_layout_registry)
+    return false;
+  if (!rxkb_context_parse_default_ruleset(kb_layout_registry)) {
+    rxkb_context_unref(kb_layout_registry);
+    kb_layout_registry = NULL;
+    return false;
+  }
+  return true;
+}
+
+static void keyboard_layout_fallback(KeyboardLayoutInfo *layout) {
+  const char *start = strchr(layout->full, '(');
+  const char *end = start ? strchr(start, ')') : NULL;
+  if (start && end && end > start) {
+    start++;
+    const char *comma = memchr(start, ',', end - start);
+    if (comma)
+      end = comma;
+    while (start < end && isspace((unsigned char)*start))
+      start++;
+    while (end > start && isspace((unsigned char)end[-1]))
+      end--;
+  } else {
+    start = layout->full;
+    end = start + strnlen(start, 2);
+  }
+  size_t len = (size_t)(end - start);
+  if (len >= sizeof(layout->short_name))
+    len = sizeof(layout->short_name) - 1;
+  for (size_t i = 0; i < len; i++)
+    layout->short_name[i] = (char)tolower((unsigned char)start[i]);
+  layout->short_name[len] = '\0';
+  if (!layout->short_description[0])
+    snprintf(layout->short_description, sizeof(layout->short_description),
+             "%s", layout->short_name);
+}
+
+static void keyboard_layout_update(KeyboardLayoutInfo *layout,
+                                   const char *full_name) {
+  memset(layout, 0, sizeof(*layout));
+  snprintf(layout->full, sizeof(layout->full), "%s",
+           full_name ? full_name : "");
+  if (keyboard_layout_registry_init()) {
+    for (struct rxkb_layout *item = rxkb_layout_first(kb_layout_registry);
+         item; item = rxkb_layout_next(item)) {
+      const char *description = rxkb_layout_get_description(item);
+      if (!description || strcmp(description, layout->full) != 0)
+        continue;
+      const char *short_name = rxkb_layout_get_name(item);
+      const char *variant = rxkb_layout_get_variant(item);
+      const char *brief = rxkb_layout_get_brief(item);
+      snprintf(layout->short_name, sizeof(layout->short_name), "%s",
+               short_name ? short_name : "");
+      snprintf(layout->variant, sizeof(layout->variant), "%s",
+               variant ? variant : "");
+      snprintf(layout->short_description,
+               sizeof(layout->short_description), "%s",
+               brief && *brief ? brief : layout->short_name);
+      break;
+    }
+  }
+  if (!layout->short_name[0])
+    keyboard_layout_fallback(layout);
+}
 
 typedef enum {
   TOUCH_TARGET_NONE,
@@ -1381,8 +1478,9 @@ static int append_module_entries(Bar *bar, int id, ModuleEntry *ents, int max,
     break;
   case M_KBLAYOUT:
     dst = texts[(*text_n)++];
-    format_value(module_fmt("keyboardlayout", g_cfg.keyboardlayout_format, bar),
-                 bar->kb_layout, "", dst, 256);
+    format_keyboardlayout(
+        module_fmt("keyboardlayout", g_cfg.keyboardlayout_format, bar),
+        &bar->kb_layout, dst, 256);
     ents[n++] = (ModuleEntry){.text = dst, .st = &g_rt->st_keyboardlayout,
                               .module = "keyboardlayout", .tag = -1};
     break;
@@ -2675,7 +2773,7 @@ static void process_ipc_msg(const char *msg) {
         if (km)
           strncpy(b->keymode, km->valuestring, sizeof(b->keymode) - 1);
         if (kl)
-          strncpy(b->kb_layout, kl->valuestring, sizeof(b->kb_layout) - 1);
+          keyboard_layout_update(&b->kb_layout, kl->valuestring);
         b->redraw = true;
       }
     }
@@ -2694,7 +2792,7 @@ static void process_ipc_msg(const char *msg) {
         if (km)
           strncpy(b->keymode, km->valuestring, sizeof(b->keymode) - 1);
         if (kl)
-          strncpy(b->kb_layout, kl->valuestring, sizeof(b->kb_layout) - 1);
+          keyboard_layout_update(&b->kb_layout, kl->valuestring);
         b->redraw = true;
       }
     }

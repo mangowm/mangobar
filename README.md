@@ -42,12 +42,13 @@ Libraries:
 - `libpulse`
 - `systemd-libs`
 - `gdk-pixbuf2`
+- `libxkbcommon`
 
 Arch:
 
 ```sh
 sudo pacman -S --needed meson ninja cjson wayland wayland-protocols \
-  fcft tllist pixman cairo pango libpulse systemd-libs gdk-pixbuf2
+  fcft tllist pixman cairo pango libpulse systemd-libs gdk-pixbuf2 libxkbcommon
 ```
 
 Debian/Ubuntu:
@@ -56,7 +57,7 @@ Debian/Ubuntu:
 sudo apt install meson ninja-build libcjson-dev libwayland-dev \
   wayland-protocols libfcft-dev libpixman-1-dev libcairo2-dev \
   libpango1.0-dev libpulse-dev libtllist-dev libsystemd-dev libgdk-pixbuf-2.0-dev \
-  pkg-config
+  libxkbcommon-dev pkg-config
 ```
 
 ### Build
