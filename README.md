@@ -73,8 +73,11 @@ sudo ninja -C build install
 If `meson.build` changes after a `git pull`, ninja re-runs meson
 automatically; install any newly added dependencies first.
 
-Runtime note: `pamixer` / `brightnessctl` are only needed if your
-config's click/scroll actions call them.
+Runtime note: built-in volume scrolling uses the existing PulseAudio
+connection. Built-in brightness scrolling writes sysfs and falls back to
+logind's `SetBrightness` method when the user cannot write sysfs, matching
+`brightnessctl`'s behavior. `pamixer` / `brightnessctl` are only needed if
+your click/scroll actions call them.
 
 ### Nix
 

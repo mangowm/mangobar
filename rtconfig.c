@@ -2,6 +2,7 @@
 #include "rtconfig.h"
 
 #include <cjson/cJSON.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -75,6 +76,22 @@ static int cfg_int(cJSON *obj, const char *key, int fallback) {
   if (cJSON_IsString(v))
     return atoi(v->valuestring);
   return fallback;
+}
+
+static double cfg_double(cJSON *obj, const char *key, double fallback) {
+  cJSON *v = cJSON_GetObjectItemCaseSensitive(obj, key);
+  double value;
+  if (cJSON_IsNumber(v)) {
+    value = v->valuedouble;
+  } else if (cJSON_IsString(v)) {
+    char *end = NULL;
+    value = strtod(v->valuestring, &end);
+    if (end == v->valuestring || *end != '\0')
+      return fallback;
+  } else {
+    return fallback;
+  }
+  return isfinite(value) ? value : fallback;
 }
 
 static bool cfg_bool(cJSON *obj, const char *key, bool fallback) {
@@ -593,6 +610,8 @@ static void parse_module_configs(cJSON *root) {
     cfg_alt(m, "brightness");
     cfg_str(m, "device", parse_target->brightness_dev,
             sizeof(parse_target->brightness_dev));
+    parse_target->brightness_scroll_step =
+        cfg_double(m, "scroll-step", parse_target->brightness_scroll_step);
     set_action("brightness",
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-click")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-click-middle")),
@@ -611,6 +630,10 @@ static void parse_module_configs(cJSON *root) {
             sizeof(parse_target->volume_muted_icon));
     cfg_str(m, "icon-bluetooth", parse_target->volume_bt_icon,
             sizeof(parse_target->volume_bt_icon));
+    parse_target->volume_scroll_step =
+        cfg_double(m, "scroll-step", parse_target->volume_scroll_step);
+    parse_target->volume_max =
+        cfg_double(m, "max-volume", parse_target->volume_max);
     cfg_icons(m, "icons", parse_target->volume_icons, &parse_target->volume_icon_count,
               MANGOBAR_MAX_ICONS);
     cfg_alt(m, "volume");
@@ -752,10 +775,13 @@ static void defaults_into(MangoConfig *cfg) {
            "");
   snprintf(cfg->brightness_fmt, sizeof(cfg->brightness_fmt), "%s",
            "☀{}%");
+  cfg->brightness_scroll_step = 2.0;
   snprintf(cfg->volume_fmt, sizeof(cfg->volume_fmt), "%s",
            "♪{}%");
   snprintf(cfg->volume_fmt_muted, sizeof(cfg->volume_fmt_muted), "%s",
            "🔇 {}%");
+  cfg->volume_scroll_step = 5.0;
+  cfg->volume_max = 100.0;
   snprintf(cfg->layout_format, sizeof(cfg->layout_format), "%s", "{}");
   snprintf(cfg->title_format, sizeof(cfg->title_format), "%s", "{}");
   snprintf(cfg->cpu_format, sizeof(cfg->cpu_format), "%s", "CPU:{}%");
@@ -823,9 +849,6 @@ static void defaults_into(MangoConfig *cfg) {
            "󰝟");
   snprintf(cfg->volume_bt_icon, sizeof(cfg->volume_bt_icon), "%s", "󰂯");
   add_action(cfg, "tags", "@view", NULL, NULL, NULL, NULL);
-  add_action(cfg, "volume", NULL, NULL, NULL, "pamixer -i 2", "pamixer -d 2");
-  add_action(cfg, "brightness", NULL, NULL, NULL, "brightnessctl s +5%",
-             "brightnessctl s 5%-");
   // Default module layout
   cfg->left_order[cfg->left_count++] = M_TAGS;
   cfg->left_order[cfg->left_count++] = M_LAYOUT;

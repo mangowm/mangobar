@@ -107,8 +107,11 @@ typedef struct {
   int tray_icon_size; // 0 = auto from bar height
   char brightness_dev[64];
   char brightness_fmt[64];
+  double brightness_scroll_step; // percentage points per scroll tick
   char volume_fmt[64];
   char volume_fmt_muted[64];
+  double volume_scroll_step; // percentage points per scroll tick
+  double volume_max;         // percentage
   char layout_format[64];
   char title_format[128];
   char cpu_format[64];

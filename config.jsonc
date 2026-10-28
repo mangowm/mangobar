@@ -77,18 +77,15 @@
     "backlight": {
         "format": "{icon} {percent}%",
         "icons": ["󰃚", "󰃛", "󰃜", "󰃝", "󰃞", "󰃟"],
-        "on-scroll-up": "bash ~/.config/mango/scripts/brightness.sh bup",
-        "on-scroll-down": "bash ~/.config/mango/scripts/brightness.sh bdown",
-        "on-click": "brightnessctl set 1%"
+        "scroll-step": 2
     },
     "pulseaudio": {
         "format": "{icon} {volume}% {bt}",
         "format-muted": "󰝟 {volume}% {bt}",
         "icons": ["󰝟", "󰕿", "󰕾"],
         // "icon-bluetooth": "󰂯",
-        "on-click": "pamixer -t",
-        "on-scroll-up": "pamixer -i 2",
-        "on-scroll-down": "pamixer -d 2"
+        "scroll-step": 5,
+        "max-volume": 150
     },
     "battery": {
         "format": "{icon} {percent}% {ac}",

@@ -739,6 +739,23 @@ static int pulse_event_fd = -1;
 static pthread_t pulse_thread;
 static atomic_bool pa_running;
 
+typedef struct {
+  int direction; // +1 = up, -1 = down
+  double step;
+  double max_pct;
+} PulseScrollRequest;
+
+#define PULSE_SCROLL_QUEUE_MAX 64
+static PulseScrollRequest pulse_scroll_queue[PULSE_SCROLL_QUEUE_MAX];
+static int pulse_scroll_head;
+static int pulse_scroll_tail;
+static pthread_mutex_t pulse_scroll_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// The PulseAudio callback and queue consumers both run on pulse_thread.
+static pa_cvolume pulse_sink_volume;
+static uint32_t pulse_sink_index;
+static bool pulse_sink_volume_valid;
+
 // udev backlight monitor: external brightness changes
 static struct udev *g_udev;
 static struct udev_monitor *g_udev_mon;
@@ -2936,6 +2953,9 @@ static bool scroll_debounced(const char *module) {
   return false;
 }
 
+static void adjust_brightness_scroll(Bar *bar, int direction);
+static void adjust_volume_scroll(Bar *bar, int direction);
+
 static void handle_module_action(Bar *bar, const char *module, int tag,
                                  uint32_t button) {
   if (bar->profile)
@@ -2950,6 +2970,19 @@ static void handle_module_action(Bar *bar, const char *module, int tag,
       sys_refresh = true; // start/refresh speed sampling promptly
   }
   const MangoAction *ma = find_action(module);
+  bool scroll = button == 4 || button == 5;
+  bool custom_scroll =
+      ma && (ma->scroll_up[0] != '\0' || ma->scroll_down[0] != '\0');
+  if (scroll && !custom_scroll) {
+    if (scroll_debounced(module))
+      return;
+    int direction = button == 4 ? 1 : -1;
+    if (strcmp(module, "brightness") == 0)
+      adjust_brightness_scroll(bar, direction);
+    else if (strcmp(module, "volume") == 0)
+      adjust_volume_scroll(bar, direction);
+    return;
+  }
   if (!ma)
     return;
   const char *cmd = NULL;
@@ -4715,7 +4748,11 @@ static void pulse_sink_cb(pa_context *c, const pa_sink_info *i, int eol,
   pa_volume_t avg = pa_cvolume_avg(&i->volume);
   int pct = (int)(((uint64_t)avg * 100 + PA_VOLUME_NORM / 2) /
                   PA_VOLUME_NORM);
-  atomic_store(&pa_pct, pct < 0 ? 0 : (pct > 100 ? 100 : pct));
+  atomic_store(&pa_pct, pct < 0 ? 0 : pct);
+  pulse_sink_volume = i->volume;
+  pulse_sink_index = i->index;
+  pulse_sink_volume_valid =
+      pa_cvolume_valid(&pulse_sink_volume) && pulse_sink_volume.channels > 0;
   atomic_store(&pa_muted, i->mute ? 1 : 0);
   int bt = 0;
   const char *api = i->proplist ? pa_proplist_gets(i->proplist, "device.api")
@@ -4788,6 +4825,7 @@ static void pulse_reconnect(void) {
   atomic_store(&pa_muted, -1);
   atomic_store(&pa_sink_bt, 0);
   atomic_store(&pa_source_bt, 0);
+  pulse_sink_volume_valid = false;
   if (pa_ctx) {
     pa_context_disconnect(pa_ctx);
     pa_context_unref(pa_ctx);
@@ -4800,9 +4838,66 @@ static void pulse_reconnect(void) {
   pa_context_connect(pa_ctx, NULL, PA_CONTEXT_NOFLAGS, NULL);
 }
 
+static void pulse_apply_scroll_requests(void) {
+  if (!pa_ctx || pa_context_get_state(pa_ctx) != PA_CONTEXT_READY ||
+      !pulse_sink_volume_valid)
+    return;
+
+  for (;;) {
+    PulseScrollRequest req;
+    pthread_mutex_lock(&pulse_scroll_mutex);
+    if (pulse_scroll_head == pulse_scroll_tail) {
+      pthread_mutex_unlock(&pulse_scroll_mutex);
+      break;
+    }
+    req = pulse_scroll_queue[pulse_scroll_head];
+    pulse_scroll_head = (pulse_scroll_head + 1) % PULSE_SCROLL_QUEUE_MAX;
+    pthread_mutex_unlock(&pulse_scroll_mutex);
+
+    if (req.step <= 0.0 || !isfinite(req.step) || !isfinite(req.max_pct))
+      continue;
+
+    double ui_max_pct =
+        (double)PA_VOLUME_UI_MAX * 100.0 / (double)PA_VOLUME_NORM;
+    double max_pct = req.max_pct < 0.0 ? 0.0 : req.max_pct;
+    if (max_pct > ui_max_pct)
+      max_pct = ui_max_pct;
+    if (req.step > ui_max_pct)
+      req.step = ui_max_pct;
+
+    pa_volume_t max_volume =
+        (pa_volume_t)llround(max_pct * PA_VOLUME_NORM / 100.0);
+    int64_t delta =
+        llround(req.step * (double)PA_VOLUME_NORM / 100.0);
+    if (delta < 1)
+      delta = 1;
+
+    pa_cvolume next = pulse_sink_volume;
+    for (uint8_t ch = 0; ch < next.channels; ch++) {
+      int64_t value = next.values[ch];
+      if (req.direction > 0) {
+        value += delta;
+        if (value > max_volume)
+          value = max_volume;
+      } else {
+        value -= delta;
+      }
+      if (value < 0)
+        value = 0;
+      next.values[ch] = (pa_volume_t)value;
+    }
+    pulse_sink_volume = next;
+    pa_operation *op = pa_context_set_sink_volume_by_index(
+        pa_ctx, pulse_sink_index, &next, NULL, NULL);
+    if (op)
+      pa_operation_unref(op);
+  }
+}
+
 static void *pulse_thread_fn(void *arg) {
   uint64_t last_try = 0;
   while (atomic_load(&pa_running) && pa_ml) {
+    pulse_apply_scroll_requests();
     // 100 ms bound keeps the reconnect check live without busy polling.
     if (pa_mainloop_prepare(pa_ml, 100000) < 0)
       break;
@@ -4821,6 +4916,28 @@ static void *pulse_thread_fn(void *arg) {
     }
   }
   return NULL;
+}
+
+static void adjust_volume_scroll(Bar *bar, int direction) {
+  if (!bar || !bar->profile || !pa_ml)
+    return;
+  g_cfg_ptr = &bar->profile->config;
+  PulseScrollRequest req = {
+      .direction = direction,
+      .step = g_cfg.volume_scroll_step,
+      .max_pct = g_cfg.volume_max,
+  };
+  if (req.step <= 0.0 || !isfinite(req.step) || !isfinite(req.max_pct))
+    return;
+
+  pthread_mutex_lock(&pulse_scroll_mutex);
+  int next = (pulse_scroll_tail + 1) % PULSE_SCROLL_QUEUE_MAX;
+  if (next != pulse_scroll_head) {
+    pulse_scroll_queue[pulse_scroll_tail] = req;
+    pulse_scroll_tail = next;
+  }
+  pthread_mutex_unlock(&pulse_scroll_mutex);
+  pa_mainloop_wakeup(pa_ml);
 }
 
 // Create the persistent PulseAudio context (called once).
@@ -4858,6 +4975,88 @@ static void update_volume() {
     bar->volume_muted = muted == 1;
     bar->volume_bt = atomic_load(&pa_sink_bt) || atomic_load(&pa_source_bt);
   }
+}
+
+static bool set_backlight_value(const char *device, unsigned int value) {
+  char path[256], text[16];
+  snprintf(path, sizeof(path), "/sys/class/backlight/%.63s/brightness",
+           device);
+  if (access(path, W_OK) == 0) {
+    FILE *f = fopen(path, "w");
+    if (f) {
+      int len = snprintf(text, sizeof(text), "%u", value);
+      bool written =
+          len > 0 && fwrite(text, 1, (size_t)len, f) == (size_t)len;
+      if (fclose(f) != 0)
+        written = false;
+      if (written)
+        return true;
+    }
+  }
+
+  // Match brightnessctl's fallback for backlights that are not writable by
+  // the user session.
+  sd_bus *bus = NULL;
+  int ret = sd_bus_default_system(&bus);
+  if (ret >= 0) {
+    ret = sd_bus_call_method(
+        bus, "org.freedesktop.login1", "/org/freedesktop/login1/session/auto",
+        "org.freedesktop.login1.Session", "SetBrightness", NULL, NULL, "ssu",
+        "backlight", device, value);
+    sd_bus_unref(bus);
+  }
+  IPC_LOG("[brightness] logind set device=%s value=%u ret=%d\n", device,
+          value, ret);
+  return ret >= 0;
+}
+
+static void adjust_brightness_scroll(Bar *bar, int direction) {
+  if (!bar || !bar->profile)
+    return;
+  g_cfg_ptr = &bar->profile->config;
+  ProfileRuntime *rt = bar->rt;
+  if (!rt)
+    return;
+  if (!rt->brightness_dev_init)
+    update_brightness();
+  if (!rt->brightness_dev[0])
+    return;
+
+  double step = g_cfg.brightness_scroll_step;
+  if (step <= 0.0 || !isfinite(step))
+    return;
+
+  char path[256], max_path[256];
+  snprintf(path, sizeof(path), "/sys/class/backlight/%.63s/brightness",
+           rt->brightness_dev);
+  snprintf(max_path, sizeof(max_path),
+           "/sys/class/backlight/%.63s/max_brightness", rt->brightness_dev);
+  unsigned int current = 0, maximum = 0;
+  FILE *f = fopen(path, "r");
+  if (f) {
+    if (fscanf(f, "%u", &current) != 1)
+      current = 0;
+    fclose(f);
+  }
+  f = fopen(max_path, "r");
+  if (f) {
+    if (fscanf(f, "%u", &maximum) != 1)
+      maximum = 0;
+    fclose(f);
+  }
+  if (maximum == 0)
+    return;
+
+  long delta = lround(step * (double)maximum / 100.0);
+  if (delta < 1)
+    delta = 1;
+  long target = (long)current + (direction > 0 ? delta : -delta);
+  if (target < 0)
+    target = 0;
+  if (target > (long)maximum)
+    target = maximum;
+  if (set_backlight_value(rt->brightness_dev, (unsigned int)target))
+    brightness_dirty = true;
 }
 
 // Battery: scan /sys/class/power_supply and fill per-instance state so
