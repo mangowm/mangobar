@@ -4713,7 +4713,8 @@ static void pulse_sink_cb(pa_context *c, const pa_sink_info *i, int eol,
   if (!i)
     return;
   pa_volume_t avg = pa_cvolume_avg(&i->volume);
-  int pct = (int)((avg * 100) / PA_VOLUME_NORM);
+  int pct = (int)(((uint64_t)avg * 100 + PA_VOLUME_NORM / 2) /
+                  PA_VOLUME_NORM);
   atomic_store(&pa_pct, pct < 0 ? 0 : (pct > 100 ? 100 : pct));
   atomic_store(&pa_muted, i->mute ? 1 : 0);
   int bt = 0;
