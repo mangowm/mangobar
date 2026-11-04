@@ -31,6 +31,7 @@
               python3
               wayland-scanner
               wayland-protocols
+              wrapGAppsNoGuiHook
             ];
 
             buildInputs = with pkgs; [
@@ -38,6 +39,7 @@
               cjson
               fcft
               gdk-pixbuf
+              librsvg
               libpulseaudio
               libxkbcommon
               pango
