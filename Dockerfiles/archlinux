@@ -1,0 +1,7 @@
+# vim: ft=Dockerfile
+
+FROM archlinux:base-devel
+
+RUN pacman -Syu --noconfirm && \
+    pacman -S --noconfirm base-devel clang git meson ninja cjson wayland wayland-protocols fcft tllist pixman cairo pango libpulse systemd-libs gdk-pixbuf2 && \
+    sed -Ei 's/#(en_(US|GB)\.UTF)/\1/' /etc/locale.gen && locale-gen
