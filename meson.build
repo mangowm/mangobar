@@ -13,6 +13,7 @@ sdbus_dep = dependency('libsystemd', 'libelogind', 'basu')
 add_project_arguments('-D' + 'SDBUS_' + sdbus_dep.name().to_upper(), language: 'c')
 
 deps = [
+  dependency('libcjson'),
   dependency('threads'),
   dependency('wayland-client'),
   dependency('fcft'),
@@ -26,7 +27,6 @@ deps = [
   dependency('gdk-pixbuf-2.0'),
   dependency('xkbregistry'),
   cc.find_library('rt'),
-  cc.find_library('cjson'),
 ]
 
 scanner = find_program('wayland-scanner')
