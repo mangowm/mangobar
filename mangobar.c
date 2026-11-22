@@ -14,7 +14,10 @@
 #include <getopt.h>
 #include <locale.h>
 #include "input-event-codes.h"
+#ifdef __linux__
 #include <linux/wireless.h>
+#endif
+#include <netinet/in.h>
 #include <libudev.h>
 #include <pixman.h>
 #include <poll.h>
@@ -53,6 +56,12 @@
 
 #ifndef MANGOBAR_VERSION
 #define MANGOBAR_VERSION "unknown"
+#endif
+
+#ifdef __FreeBSD__
+#include <sys/types.h>
+#include <sys/resource.h>
+#include <sys/sysctl.h>
 #endif
 
 static void print_usage(const char *prog) {
@@ -4376,7 +4385,9 @@ static const struct wl_touch_listener touch_listener = {
 };
 
 // ---------- System info (CPU / mem / backlight / volume / time) ----------
+#ifndef __FreeBSD__
 static int cpu_prev_total, cpu_prev_idle;
+#endif
 static uint64_t last_cpu_ms;
 
 static void update_brightness() {
@@ -4529,6 +4540,7 @@ static void iface_wifi_info(const char *ifn, char *ssid, size_t ssidsz,
     ssid[0] = '\0';
   if (dbm)
     *dbm = 0;
+#ifdef __linux__
   int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0)
     return;
@@ -4570,6 +4582,7 @@ static void iface_wifi_info(const char *ifn, char *ssid, size_t ssidsz,
     }
   }
   close(fd);
+#endif
 }
 
 // IPv4 address currently assigned to the interface, as a dotted quad
@@ -5198,6 +5211,35 @@ static void update_cpu(void) {
   if (ms - last_cpu_ms < 500)
     return;
   last_cpu_ms = ms;
+#ifdef __FreeBSD__
+  long cp_time[CPUSTATES];
+  size_t len = sizeof(cp_time);
+  if (sysctlbyname("kern.cp_time", cp_time, &len, NULL, 0) == 0) {
+    static long prev_total, prev_idle;
+    long total = 0;
+    for (int i = 0; i < CPUSTATES; i++)
+      total += cp_time[i];
+    long idle = cp_time[CP_IDLE];
+    int pct = 0;
+    if (prev_total) {
+      long total_d = total - prev_total;
+      long idle_d = idle - prev_idle;
+      if (total_d > 0)
+        pct = (int)(100 * (total_d - idle_d) / total_d);
+    }
+    prev_total = total;
+    prev_idle = idle;
+    Bar *b;
+    wl_list_for_each(b, &bar_list, link) b->cpu_pct = pct;
+  }
+  double load1 = 0;
+  if (getloadavg(&load1, 1) == 1) {
+    // Round up to two decimals, matching loadavg's usual display.
+    load1 = ceil(load1 * 100.0) / 100.0;
+    Bar *b;
+    wl_list_for_each(b, &bar_list, link) b->cpu_load = load1;
+  }
+#else
   FILE *f = fopen("/proc/stat", "r");
   if (f) {
     char cpu[8];
@@ -5229,9 +5271,30 @@ static void update_cpu(void) {
     }
     fclose(lf);
   }
+#endif
 }
 
+#ifdef __FreeBSD__
+static int sysctl_uint(const char *name, u_int *out) {
+  size_t len = sizeof(*out);
+  return sysctlbyname(name, out, &len, NULL, 0);
+}
+#endif
+
 static void update_mem(void) {
+#ifdef __FreeBSD__
+  // FreeBSD has no MemAvailable; free + inactive pages is the usual
+  // equivalent (inactive pages can be reclaimed without writeback).
+  u_int total = 0, free_p = 0, inact = 0;
+  if (sysctl_uint("vm.stats.vm.v_page_count", &total) == 0 &&
+      sysctl_uint("vm.stats.vm.v_free_count", &free_p) == 0 &&
+      sysctl_uint("vm.stats.vm.v_inactive_count", &inact) == 0 && total) {
+    uint64_t avail = (uint64_t)free_p + inact;
+    int pct = (int)(100 - avail * 100 / total);
+    Bar *b;
+    wl_list_for_each(b, &bar_list, link) b->mem_pct = pct;
+  }
+#else
   FILE *f = fopen("/proc/meminfo", "r");
   if (f) {
     long total = 0, avail = 0;
@@ -5247,7 +5310,9 @@ static void update_mem(void) {
     Bar *b;
     wl_list_for_each(b, &bar_list, link) b->mem_pct = pct;
   }
+#endif
 }
+
 
 static void update_clock(void) {
   time_t now = time(NULL);
