@@ -109,30 +109,59 @@ static const uint32_t separator_bg_color_hex = 0x201B14FF;
 static const uint32_t middle_bg_color_hex = 0x201B14FF;
 static const uint32_t middle_bg_sel_color_hex = 0x201B14FF;
 
+static bool utf8_codepoint_is_valid(uint32_t codepoint) {
+  if (codepoint > 0x10FFFF)
+    return false;
+  if (codepoint >= 0xD800 && codepoint <= 0xDFFF)
+    return false;
+  if ((codepoint & 0xFFFE) == 0xFFFE)
+    return false;
+  if (codepoint >= 0xFDD0 && codepoint <= 0xFDEF)
+    return false;
+  return true;
+}
+
 static uint32_t utf8_decode(uint32_t *state, uint32_t *codep, uint8_t byte) {
-  static const uint8_t len_tab[] = {0, 0, 0, 0, 0, 0, 0, 0,
-                                    0, 0, 0, 0, 1, 1, 2, 3};
   if (*state == 0) {
     if (byte < 0x80) {
       *codep = byte;
       return 0;
     }
-    int len = len_tab[byte >> 4];
-    if (len < 1) {
-      *state = 1;
+
+    uint32_t remaining;
+    if (byte >= 0xC2 && byte <= 0xDF) {
+      *codep = byte & 0x1F;
+      remaining = 1;
+    } else if (byte >= 0xE0 && byte <= 0xEF) {
+      *codep = byte & 0x0F;
+      remaining = 2;
+    } else if (byte >= 0xF0 && byte <= 0xF4) {
+      *codep = byte & 0x07;
+      remaining = 3;
+    } else {
       return 1;
     }
-    *codep = byte & (0x7F >> len);
-    *state = len;
+    *state = ((uint32_t)byte << 8) | remaining;
     return 1;
   }
+
   if ((byte & 0xC0) != 0x80) {
-    *state = 1;
+    *state = 0;
     return 1;
   }
+
+  uint32_t first = *state >> 8;
+  uint32_t remaining = *state & 0xFF;
   *codep = (*codep << 6) | (byte & 0x3F);
-  if (--*state == 0)
+  remaining--;
+  if (remaining == 0) {
+    *state = 0;
+    uint32_t minimum = first >= 0xF0 ? 0x10000 : first >= 0xE0 ? 0x800 : 0x80;
+    if (*codep < minimum || !utf8_codepoint_is_valid(*codep))
+      return 1;
     return 0;
+  }
+  *state = (first << 8) | remaining;
   return 1;
 }
 
